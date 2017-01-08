@@ -4196,6 +4196,9 @@ void Options::parse(int argc, const char* argv[])
 					throw "-add_ast_path missing <option>";
 				fASTFilePaths.push_back(path);
 			}
+			else if ( strcmp(arg, "-rpath-link") == 0 ) {
+				i++;
+			}
 			else if ( strcmp(arg, "-force_load_swift_libs") == 0 ) {
 				// previously handled by buildSearchPaths()
 			}
