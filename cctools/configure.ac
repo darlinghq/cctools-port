@@ -1,4 +1,4 @@
-AC_INIT([cctools], [886], [t.poechtrager@gmail.com])
+AC_INIT([cctools], [895], [t.poechtrager@gmail.com])
 
 AC_CANONICAL_BUILD
 AC_CANONICAL_HOST
@@ -312,8 +312,13 @@ AC_LINK_IFELSE(
 LDFLAGS=$ORIGLDFLAGS
 
 CHECK_LLVM
-
 LDFLAGS="$LDFLAGS $LTO_RPATH"
+
+### Check for libfts (musl) ###
+
+AC_CHECK_LIB([fts],[fts_open],[
+  AC_CHECK_HEADERS([fts.h], [FTS_LIB=-lfts])], [])
+AC_SUBST(FTS_LIB)
 
 ### Check for libxar ###
 
@@ -323,6 +328,73 @@ AC_CHECK_LIB([xar],[xar_prop_create],[
   AC_CHECK_HEADERS([xar/xar.h], [XAR_LIB=-lxar])], [])
 AC_SUBST(XAR_LIB)
 
+fi
+
+### Check for Apple TAPI library ###
+
+AC_ARG_ENABLE([tapi-support],
+AS_HELP_STRING([--enable-tapi-support],
+                [enable tapi support]),
+[], [enable_tapi_support=yes])
+
+if test "x$enable_tapi_support" = "xyes"; then
+
+AC_ARG_WITH([libtapi],
+    AS_HELP_STRING([--with-libtapi],
+                   [path to the apple tapi library]),
+    [LIBTAPI_DIR=$with_libtapi], [LIBTAPI_DIR=""])
+
+if test "x$LIBTAPI_DIR" = "xno"; then
+  LIBTAPI_DIR=""
+fi
+if test "x$LIBTAPI_DIR" != "x"; then
+  CXXFLAGS="$CXXFLAGS -isystem $LIBTAPI_DIR/include"
+  CPPFLAGS="$CPPFLAGS -isystem $LIBTAPI_DIR/include"
+  test -d "$LIBTAPI_DIR/lib" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib"
+  test -d "$LIBTAPI_DIR/lib64" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib64"
+  test -d "$LIBTAPI_DIR/lib32" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib32"
+  if test "x$rpathlink" = "xyes"; then
+    LIBTAPI_RPATH="-Wl,-rpath,$LIBTAPI_DIR/lib,--enable-new-dtags"
+    LIBTAPI_RPATH="$LIBTAPI_RPATH -Wl,-rpath,$LIBTAPI_DIR/lib64,--enable-new-dtags"
+    LIBTAPI_RPATH="$LIBTAPI_RPATH -Wl,-rpath,$LIBTAPI_DIR/lib32,--enable-new-dtags"
+    LDFLAGS="$LDFLAGS $LIBTAPI_RPATH"
+  fi
+  if test "x$isdarwin" = "xyes"; then
+    LIBTAPI_RPATH="-Wl,-rpath,$LIBTAPI_DIR/lib"
+    LDFLAGS="$LDFLAGS $LIBTAPI_RPATH"
+  fi
+fi
+
+TAPI_LIB=""
+AC_CACHE_CHECK([tapi/tapi.h and libtapi support],[cctools_cv_tapi_support],
+  AC_LANG_PUSH([C++])
+  save_LIBS="$LIBS"
+  LIBS="$LIBS -ltapi"
+  AC_TRY_LINK([#include <tapi/tapi.h>],
+              [return tapi::APIVersion::getMajor();],
+              [cctools_cv_tapi_support=yes],
+              [cctools_cv_tapi_support=no])
+  LIBS="$save_LIBS"
+  AC_LANG_POP([C++])
+)
+
+if test $cctools_cv_tapi_support = yes; then
+  TAPI_LIB=-ltapi
+  TAPI_DEF=-DTAPI_SUPPORT
+else
+  if test "x$LIBTAPI_DIR" != "x"; then
+    AC_MSG_ERROR([-- ERROR: Failed TAPI checks in $LIBTAPI_DIR])
+    exit 1
+  fi
+  echo ""
+  echo "### Building without TAPI support ###"
+  echo "### See README.md -> DEPENDENCIES ###"
+  echo ""
+  sleep 2
+fi
+
+AC_SUBST(TAPI_LIB)
+AC_SUBST(TAPI_DEF)
 fi
 
 ### Check whether we want to use clang as assembler ###

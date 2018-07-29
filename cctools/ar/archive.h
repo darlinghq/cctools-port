@@ -62,6 +62,7 @@
  */
 
 #include <stdint.h>
+#include <sys/types.h>
 
 /* Ar(1) options. */
 #define	AR_A	0x0001

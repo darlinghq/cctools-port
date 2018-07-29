@@ -1,8 +1,8 @@
 #ifndef _HELPER_H
 #define _HELPER_H
 
-#ifdef __cplusplus
-extern "C" {
+#ifndef __USE_GNU
+#define __USE_GNU
 #endif
 
 #ifndef __has_extension
@@ -17,24 +17,18 @@ extern "C" {
 #define __has_include_next(x) 0
 #endif
 
-#include <mach/mach_time.h>
-#include <mach/mach_host.h>
-#include <mach/host_info.h>
-#include <sys/time.h>
-
-#ifndef __USE_GNU
-#define __USE_GNU
-#endif
-
-#ifndef __APPLE__
-typedef char uuid_string_t__[37];
-#define uuid_string_t uuid_string_t__
-#endif
-
 #ifdef __NetBSD__
 #define stoi(a,b) atoi(a.c_str()); do { if (!b) break; const char *p = a.c_str(); *b = 0; while (isdigit(*p++)) (*b)++; } while (0)
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <mach/mach_time.h>
+#include <mach/mach_host.h>
+#include <mach/host_info.h>
+#include <sys/time.h>
 #include <dlfcn.h>
 
 struct dyld_unwind_sections
@@ -47,6 +41,11 @@ struct dyld_unwind_sections
 };
 
 typedef Dl_info dl_info;
+
+#ifndef __APPLE__
+typedef char uuid_string_t__[37];
+#define uuid_string_t uuid_string_t__
+#endif
 
 int _NSGetExecutablePath(char *path, unsigned int *size);
 int _dyld_find_unwind_sections(void* i, struct dyld_unwind_sections* sec);
