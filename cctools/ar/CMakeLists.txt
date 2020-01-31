@@ -1,5 +1,9 @@
 project(ar)
 
+if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
+    add_compile_definitions(__arm64__)
+endif()
+
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include/foreign)
 

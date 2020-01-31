@@ -1,5 +1,9 @@
 project(ld64)
 
+if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
+    add_compile_definitions(__arm64__)
+endif()
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fblocks -std=c++11 -Wno-long-long -Wno-import -Wno-format -Wno-deprecated -Wno-unused-variable -Wno-unused-private-field -Wno-unused-function -Wno-invalid-offsetof -Wno-int-conversion -Wno-char-subscripts -Wno-shift-negative-value")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../include)
