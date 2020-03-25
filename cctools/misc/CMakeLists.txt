@@ -8,8 +8,6 @@ include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include/foreign)
 
 add_definitions(-U__APPLE__
-	-DEMULATED_HOST_CPU_TYPE=16777223
-	-DEMULATED_HOST_CPU_SUBTYPE=3
 	-D__STDC_LIMIT_MACROS=1
 	-D__STDC_CONSTANT_MACROS=1
 	-DHAVE_EXECINFO_H=1
@@ -23,6 +21,19 @@ add_definitions(-U__APPLE__
 	-DPACKAGE_NAME="lipo"
 	-DRANLIB
 	-DPACKAGE_VERSION="1.0")
+
+# i386 has a different CPU type/subtype, but Darling only supports x86_64
+if (TARGET_x86_64 OR TARGET_i386)
+	add_definitions(
+		-DEMULATED_HOST_CPU_TYPE=16777223
+		-DEMULATED_HOST_CPU_SUBTYPE=3
+	)
+elseif (TARGET_ARM64)
+	add_definitions(
+		-DEMULATED_HOST_CPU_TYPE=16777228
+		-DEMULATED_HOST_CPU_SUBTYPE=0
+	)
+endif(TARGET_x86_64 OR TARGET_i386)
 
 add_library(stuff OBJECT
 	../libstuff/fatals.c
