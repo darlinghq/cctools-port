@@ -1,4 +1,4 @@
-AC_INIT([cctools], [895], [t.poechtrager@gmail.com])
+AC_INIT([cctools], [949.0.1], [t.poechtrager@gmail.com])
 
 AC_CANONICAL_BUILD
 AC_CANONICAL_HOST
@@ -9,7 +9,6 @@ AC_ARG_PROGRAM
 AM_CONDITIONAL([ISDARWIN], [false])
 
 isdarwin=no
-iscygwin=no
 
 if test "x$CFLAGS" = "x"; then
   CFLAGS="-O3"
@@ -43,69 +42,25 @@ case $host_os in
     isdarwin=yes
     AM_CONDITIONAL([ISDARWIN], [true])
   ;;
-  openbsd* )
-    XCC="egcc"
-    XCXX="eg++"
-  ;;
   cygwin* )
-    iscygwin=yes
-    # https://github.com/tpoechtrager/osxcross/issues/87
-    EXTRAFLAGS="-D__LARGE64_FILES -D_GNU_SOURCE -fno-PIC"
-    WARNINGS="-Wno-attributes"
-    XCC="gcc"
-    XCXX="g++"
+    echo "Cygwin is no longer supported." 1>&2
+    exit 1
   ;;
 esac
 
-if test "x$isdarwin" = "xno"; then
-  case $host_cpu in
-    arm* )
-      # clang miscompiles ld64 on arm
-      if test "x$isdarwin" = "xno"; then
-        XCC="gcc"
-        XCXX="g++"
-      fi
-    ;;
-  esac
-fi
-
-if test "x$XCC" = "x"; then
-  XCC="clang"
-fi
-
-if test "x$XCXX" = "x"; then
-  XCXX="clang++"
-fi
-
 if test "x$CC" = "x"; then
   if test "x$build" != "x$host"; then
-    CC="${host_alias}-${XCC}"
-    which $CC 2>/dev/null 1>&2
-    if test $? -ne 0; then
-      CC="${host_alias}-gcc"
-    fi
+    CC="${host_alias}-clang"
    else
-    CC=$XCC
-    which $CC 2>/dev/null 1>&2
-    if test $? -ne 0; then
-      CC="gcc"
-    fi
+    CC=clang
   fi
 fi
 
 if test "x$CXX" = "x"; then
   if test "x$build" != "x$host"; then
-    CXX="${host_alias}-${XCXX}"
-    which $CXX 2>/dev/null 1>&2
-    if test $? -ne 0; then
-      CXX="${host_alias}-g++"
-    fi
+    CXX="${host_alias}-clang++"
   else
-    CXX=$XCXX
-    which $CXX 2>/dev/null 1>&2
-    if test $? -ne 0; then
-      CXX="g++"
-    fi
+    CXX=clang++
   fi
 fi
 
@@ -120,26 +75,19 @@ case "$CCVERSION" in
     OBJCWARNINGS="-Wall -Wno-objc-root-class -Wno-deprecated-objc-isa-usage"
   ;;
   * )
-    WARNINGS="$WARNINGS -Wall -Wno-format -Wno-enum-compare -Wno-unused-result -Wno-unused-variable"
-    WARNINGS="$WARNINGS -Wno-unused-but-set-variable -Wno-deprecated -Wno-deprecated-declarations"
-    WARNINGS="$WARNINGS -Wno-char-subscripts -Wno-strict-aliasing"
-    OBJCWARNINGS="-Wall"
-    CFLAGS="$CFLAGS -std=gnu99 -D__private_extern__="
-    CXXFLAGS="$CXXFLAGS -D__private_extern__="
+    echo "You must compile this project with clang. Other compilers are no longer supported." 2>&1
+    exit 1
   ;;
 esac
+
+EXTRAFLAGS="$EXTRAFLAGS -DLD64_VERSION_NUM=512.4"
 
 case "$CXXVERSION" in
   *clang* )
     if test "x$isdarwin" = "xyes"; then
       CXXFLAGS="$CXXFLAGS -stdlib=libc++"
     fi
-    # can't use -fblocks on cyggwin due to a clang driver bug
-    if test "x$iscygwin" = "xno"; then
-      EXTRACXXFLAGS="$EXTRACXXFLAGS -fblocks"
-    else
-      EXTRAFLAGS="$EXTRAFLAGS -integrated-as"
-    fi
+    EXTRACXXFLAGS="$EXTRACXXFLAGS -fblocks"
   ;;
 esac
 
@@ -154,21 +102,6 @@ case $host_cpu in
     EXTRAFLAGS="$EXTRAFLAGS -D__arm64__"
   ;;
   arm*)
-    case "$CXXVERSION" in
-      *clang* )
-        echo "" >&2
-        echo "clang is known to miscompile ld64 on arm platforms:" >&2
-        echo "https://github.com/tpoechtrager/cctools-port/issues/1#issuecomment-59118615" >&2
-        if test "x$isdarwin" = "xno"; then
-          echo "" >&2
-          echo "please use gcc instead;  CC=gcc CXX=g++ ./configure" >&2
-          echo "" >&2
-          exit 1
-        fi
-        echo "" >&2
-        sleep 2
-      ;;
-    esac
     EXTRAFLAGS="$EXTRAFLAGS -D__arm__"
   ;;
 esac
@@ -268,7 +201,65 @@ AC_CHECK_LIB([uuid],[uuid_generate_random],[
   AC_CHECK_HEADERS([uuid/uuid.h], [UUID_LIB=-luuid])], [])
 AC_SUBST(UUID_LIB)
 
-AC_CHECK_FUNCS([strmode])
+AC_CHECK_FUNCS([strmode utimens utimensat])
+AC_CHECK_FUNCS([bcopy bcmp bzero index rindex])
+
+### Check how to access struct stat's tv_nsec field.
+AC_MSG_CHECKING(for st_mtimespec.tv_nsec in struct stat)
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM(
+    [[#include <sys/stat.h>]],
+    [[
+    struct stat st;
+    st.st_mtimespec.tv_nsec = 0;
+    ]])],
+  [AC_DEFINE(HAVE_STAT_ST_MTIMESPEC, 1, [struct stat has st_mtimespec.tv_nsec])
+   AC_MSG_RESULT([yes])],
+  [AC_MSG_RESULT([no])])
+
+AC_MSG_CHECKING(for st_mtim.tv_nsec in struct stat)
+AC_COMPILE_IFELSE(
+  [AC_LANG_PROGRAM(
+    [[#include <sys/stat.h>]],
+    [[
+    struct stat st;
+    st.st_mtim.tv_nsec = 0;
+    ]])],
+  [AC_DEFINE(HAVE_STAT_ST_MTIM, 1, [struct stat has st_mtim.tv_nsec])
+   AC_MSG_RESULT([yes])],
+  [AC_MSG_RESULT([no])])
+
+### Check for log2 in -lm
+
+AC_CHECK_LIB([m], [log2], [
+  MATH_LIB="-lm"
+])
+
+AC_SUBST(MATH_LIB)
+
+### Check for reallocf in -lc, -lbsd
+
+AC_CHECK_HEADERS([bsd/stdlib.h], [])
+
+AC_CHECK_LIB([c],[reallocf],[
+    REALLOCF_LIB=""
+    AC_DEFINE(HAVE_REALLOCF, 1)
+  ],[
+  AC_CHECK_LIB([bsd],[reallocf],[
+    REALLOCF_LIB=-lbsd
+    AC_DEFINE(HAVE_REALLOCF, 1)
+  ],[])
+])
+
+AC_SUBST(REALLOCF_LIB)
+
+### Check for clock_gettime
+
+AC_CHECK_FUNC([clock_gettime],[AC_DEFINE(HAVE_CLOCK_GETTIME, 1)])
+
+### Check for write64
+
+AC_CHECK_FUNC([write64],[AC_DEFINE(HAVE_WRITE64, 1)])
 
 ### Check for __cxa_demangle in various C++ ABI libs ###
 
@@ -282,6 +273,14 @@ AC_CHECK_LIB([c++abi],[__cxa_demangle],[CXXABI_LIB=-lc++abi],[
 
 AC_SUBST(CXXABI_LIB)
 
+### Check for __gcc_personality_v0 in -lgcc (NetBSD needs this)
+
+AC_CHECK_LIB([gcc], [__gcc_personality_v0], [
+  GCC_LIB="-lgcc"
+])
+
+AC_SUBST(GCC_LIB)
+
 ### Check for supported warning options ###
 
 ORIGCFLAGS=$CFLAGS
@@ -290,6 +289,17 @@ AC_MSG_CHECKING([whether $CC supports -Wno-shift-negative-value])
 AC_COMPILE_IFELSE(
   [AC_LANG_SOURCE([[int dummy;]])],
   [WARNINGS="$WARNINGS -Wno-shift-negative-value"
+   AC_MSG_RESULT([yes])],
+  [AC_MSG_RESULT([no])]
+)
+CFLAGS=$ORIGCFLAGS
+
+ORIGCFLAGS=$CFLAGS
+CFLAGS="$CFLAGS -Werror -Wno-misleading-indentation"
+AC_MSG_CHECKING([whether $CC supports -Wno-misleading-indentation])
+AC_COMPILE_IFELSE(
+  [AC_LANG_SOURCE([[int dummy;]])],
+  [WARNINGS="$WARNINGS -Wno-misleading-indentation"
    AC_MSG_RESULT([yes])],
   [AC_MSG_RESULT([no])]
 )
@@ -320,14 +330,48 @@ AC_CHECK_LIB([fts],[fts_open],[
   AC_CHECK_HEADERS([fts.h], [FTS_LIB=-lfts])], [])
 AC_SUBST(FTS_LIB)
 
-### Check for libxar ###
+### Check for XAR ###
 
-if test "x$LLVM_CONFIG" != "xno"; then
+AC_ARG_ENABLE([xar-support],
+AS_HELP_STRING([--enable-xar-support],
+                [enable xar support]),
+[], [enable_xar_support=yes])
 
-AC_CHECK_LIB([xar],[xar_prop_create],[
-  AC_CHECK_HEADERS([xar/xar.h], [XAR_LIB=-lxar])], [])
-AC_SUBST(XAR_LIB)
+if test "x$LTO_LIB" != "x"; then
+  if test "x$enable_xar_support" = "xyes"; then
+    AC_ARG_WITH([libxar],
+        AS_HELP_STRING([--with-libxar],
+                      [path to the XAR library]),
+        [XAR_DIR=$with_libxar], [XAR_DIR=""])
 
+    if test "x$XAR_DIR" = "xno"; then
+      XAR_DIR=""
+    fi
+
+    if test "x$XAR_DIR" != "x"; then
+      CXXFLAGS="$CXXFLAGS -isystem $XAR_DIR/include"
+      CPPFLAGS="$CPPFLAGS -isystem $XAR_DIR/include"
+      test -d "$XAR_DIR/lib" && LDFLAGS="$LDFLAGS -L$XAR_DIR/lib"
+      test -d "$XAR_DIR/lib64" && LDFLAGS="$LDFLAGS -L$XAR_DIR/lib64"
+      test -d "$XAR_DIR/lib32" && LDFLAGS="$LDFLAGS -L$XAR_DIR/lib32"
+      if test "x$rpathlink" = "xyes"; then
+        XAR_RPATH="-Wl,-rpath,$XAR_DIR/lib,--enable-new-dtags"
+        XAR_RPATH="$XAR_RPATH -Wl,-rpath,$XAR_DIR/lib64,--enable-new-dtags"
+        XAR_RPATH="$XAR_RPATH -Wl,-rpath,$XAR_DIR/lib32,--enable-new-dtags"
+        LDFLAGS="$LDFLAGS $XAR_RPATH"
+      fi
+      if test "x$isdarwin" = "xyes"; then
+        XAR_RPATH="-Wl,-rpath,$XAR_DIR/lib"
+        LDFLAGS="$LDFLAGS $XAR_RPATH"
+      fi
+    fi
+
+    XAR_LIB=""
+
+    AC_CHECK_LIB([xar],[xar_prop_create],[
+      AC_CHECK_HEADERS([xar/xar.h], [XAR_LIB=-lxar])], [])
+    AC_SUBST(XAR_LIB)
+  fi
 fi
 
 ### Check for Apple TAPI library ###
@@ -338,63 +382,61 @@ AS_HELP_STRING([--enable-tapi-support],
 [], [enable_tapi_support=yes])
 
 if test "x$enable_tapi_support" = "xyes"; then
+  AC_ARG_WITH([libtapi],
+      AS_HELP_STRING([--with-libtapi],
+                    [path to the apple tapi library]),
+      [LIBTAPI_DIR=$with_libtapi], [LIBTAPI_DIR=""])
 
-AC_ARG_WITH([libtapi],
-    AS_HELP_STRING([--with-libtapi],
-                   [path to the apple tapi library]),
-    [LIBTAPI_DIR=$with_libtapi], [LIBTAPI_DIR=""])
-
-if test "x$LIBTAPI_DIR" = "xno"; then
-  LIBTAPI_DIR=""
-fi
-if test "x$LIBTAPI_DIR" != "x"; then
-  CXXFLAGS="$CXXFLAGS -isystem $LIBTAPI_DIR/include"
-  CPPFLAGS="$CPPFLAGS -isystem $LIBTAPI_DIR/include"
-  test -d "$LIBTAPI_DIR/lib" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib"
-  test -d "$LIBTAPI_DIR/lib64" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib64"
-  test -d "$LIBTAPI_DIR/lib32" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib32"
-  if test "x$rpathlink" = "xyes"; then
-    LIBTAPI_RPATH="-Wl,-rpath,$LIBTAPI_DIR/lib,--enable-new-dtags"
-    LIBTAPI_RPATH="$LIBTAPI_RPATH -Wl,-rpath,$LIBTAPI_DIR/lib64,--enable-new-dtags"
-    LIBTAPI_RPATH="$LIBTAPI_RPATH -Wl,-rpath,$LIBTAPI_DIR/lib32,--enable-new-dtags"
-    LDFLAGS="$LDFLAGS $LIBTAPI_RPATH"
+  if test "x$LIBTAPI_DIR" = "xno"; then
+    LIBTAPI_DIR=""
   fi
-  if test "x$isdarwin" = "xyes"; then
-    LIBTAPI_RPATH="-Wl,-rpath,$LIBTAPI_DIR/lib"
-    LDFLAGS="$LDFLAGS $LIBTAPI_RPATH"
-  fi
-fi
-
-TAPI_LIB=""
-AC_CACHE_CHECK([tapi/tapi.h and libtapi support],[cctools_cv_tapi_support],
-  AC_LANG_PUSH([C++])
-  save_LIBS="$LIBS"
-  LIBS="$LIBS -ltapi"
-  AC_TRY_LINK([#include <tapi/tapi.h>],
-              [return tapi::APIVersion::getMajor();],
-              [cctools_cv_tapi_support=yes],
-              [cctools_cv_tapi_support=no])
-  LIBS="$save_LIBS"
-  AC_LANG_POP([C++])
-)
-
-if test $cctools_cv_tapi_support = yes; then
-  TAPI_LIB=-ltapi
-  TAPI_DEF=-DTAPI_SUPPORT
-else
   if test "x$LIBTAPI_DIR" != "x"; then
-    AC_MSG_ERROR([-- ERROR: Failed TAPI checks in $LIBTAPI_DIR])
-    exit 1
+    CXXFLAGS="$CXXFLAGS -isystem $LIBTAPI_DIR/include"
+    CPPFLAGS="$CPPFLAGS -isystem $LIBTAPI_DIR/include"
+    test -d "$LIBTAPI_DIR/lib" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib"
+    test -d "$LIBTAPI_DIR/lib64" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib64"
+    test -d "$LIBTAPI_DIR/lib32" && LDFLAGS="$LDFLAGS -L$LIBTAPI_DIR/lib32"
+    if test "x$rpathlink" = "xyes"; then
+      LIBTAPI_RPATH="-Wl,-rpath,$LIBTAPI_DIR/lib,--enable-new-dtags"
+      LIBTAPI_RPATH="$LIBTAPI_RPATH -Wl,-rpath,$LIBTAPI_DIR/lib64,--enable-new-dtags"
+      LIBTAPI_RPATH="$LIBTAPI_RPATH -Wl,-rpath,$LIBTAPI_DIR/lib32,--enable-new-dtags"
+      LDFLAGS="$LDFLAGS $LIBTAPI_RPATH"
+    fi
+    if test "x$isdarwin" = "xyes"; then
+      LIBTAPI_RPATH="-Wl,-rpath,$LIBTAPI_DIR/lib"
+      LDFLAGS="$LDFLAGS $LIBTAPI_RPATH"
+    fi
   fi
-  echo ""
-  echo "### Building without TAPI support ###"
-  echo "### See README.md -> DEPENDENCIES ###"
-  echo ""
-  sleep 2
-fi
 
-AC_SUBST(TAPI_LIB)
-AC_SUBST(TAPI_DEF)
+  TAPI_LIB=""
+  AC_CACHE_CHECK([tapi/tapi.h and libtapi support],[cctools_cv_tapi_support],
+    AC_LANG_PUSH([C++])
+    save_LIBS="$LIBS"
+    LIBS="$LIBS -ltapi"
+    AC_TRY_LINK([#include <tapi/tapi.h>],
+                [return tapi::APIVersion::getMajor();],
+                [cctools_cv_tapi_support=yes],
+                [cctools_cv_tapi_support=no])
+    LIBS="$save_LIBS"
+    AC_LANG_POP([C++])
+  )
+
+  if test $cctools_cv_tapi_support = yes; then
+    TAPI_LIB=-ltapi
+    TAPI_DEF=-DTAPI_SUPPORT
+  else
+    if test "x$LIBTAPI_DIR" != "x"; then
+      AC_MSG_ERROR([-- ERROR: Failed TAPI checks in $LIBTAPI_DIR])
+      exit 1
+    fi
+    echo ""
+    echo "### Building without TAPI support ###"
+    echo "### See README.md -> DEPENDENCIES ###"
+    echo ""
+  fi
+
+  AC_SUBST(TAPI_LIB)
+  AC_SUBST(TAPI_DEF)
 fi
 
 ### Check whether we want to use clang as assembler ###
@@ -414,7 +456,7 @@ AC_C_BIGENDIAN([AC_SUBST([ENDIAN_FLAG],[-D__BIG_ENDIAN__=1])],
       [AC_SUBST([ENDIAN_FLAG],[-D__LITTLE_ENDIAN__=1])])
 
 
-AC_CONFIG_FILES([Makefile libstuff/Makefile])
+AC_CONFIG_FILES([Makefile libstuff/Makefile libmacho/Makefile])
 AC_CONFIG_FILES([ar/Makefile])
 AC_CONFIG_FILES([as/Makefile])
 AC_CONFIG_FILES([as/arm/Makefile])
@@ -422,15 +464,13 @@ AC_CONFIG_FILES([as/i386/Makefile])
 AC_CONFIG_FILES([as/x86_64/Makefile])
 AC_CONFIG_FILES([as/ppc/Makefile])
 AC_CONFIG_FILES([as/ppc64/Makefile])
-#AC_CONFIG_FILES([man/Makefile])
+AC_CONFIG_FILES([man/Makefile])
 AC_CONFIG_FILES([misc/Makefile])
 AC_CONFIG_FILES([otool/Makefile])
-
-if test "x$isdarwin" != "xyes"; then
-  AC_CONFIG_FILES([libobjc2/Makefile])
-fi
-
+AC_CONFIG_FILES([efitools/Makefile])
+AC_CONFIG_FILES([libobjc2/Makefile])
 AC_CONFIG_FILES([ld64/Makefile])
+AC_CONFIG_FILES([ld64/doc/man/Makefile])
 AC_CONFIG_FILES([ld64/src/Makefile])
 AC_CONFIG_FILES([ld64/src/3rd/Makefile])
 AC_CONFIG_FILES([ld64/src/3rd/BlocksRuntime/Makefile])

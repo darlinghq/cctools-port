@@ -60,22 +60,22 @@ class ImageCachePointerAtom : public ld::Atom {
 public:
 											ImageCachePointerAtom(ld::passes::stubs::Pass& pass)
 				: ld::Atom(_s_section, ld::Atom::definitionRegular, ld::Atom::combineNever,
-							ld::Atom::scopeLinkageUnit, ld::Atom::typeNonLazyPointer, 
-							symbolTableNotIn, false, false, false, ld::Atom::Alignment(3)) { pass.addAtom(*this); }
+							ld::Atom::scopeTranslationUnit, ld::Atom::typeUnclassified,
+							symbolTableIn, false, false, false, ld::Atom::Alignment(3)) { pass.addAtom(*this); }
 
 	virtual const ld::File*					file() const					{ return NULL; }
-	virtual const char*						name() const					{ return "image cache pointer"; }
+	virtual const char*						name() const					{ return "__dyld_private"; }
 	virtual uint64_t						size() const					{ return 8; }
 	virtual uint64_t						objectAddress() const			{ return 0; }
 	virtual void							copyRawContent(uint8_t buffer[]) const { }
 	virtual void							setScope(Scope)					{ }
 
 private:
-	
+
 	static ld::Section						_s_section;
 };
 
-ld::Section ImageCachePointerAtom::_s_section("__DATA", "__got", ld::Section::typeNonLazyPointer);
+ld::Section ImageCachePointerAtom::_s_section("__DATA", "__data", ld::Section::typeUnclassified);
 
 
 
@@ -145,12 +145,12 @@ ld::Section StubHelperHelperAtom::_s_section("__TEXT", "__stub_helper", ld::Sect
 class StubHelperAtom : public ld::Atom {
 public:
 											StubHelperAtom(ld::passes::stubs::Pass& pass, const ld::Atom* lazyPointer,
-																							const ld::Atom& stubTo)
+														   const ld::Atom& stubTo, bool stubToResolver)
 				: ld::Atom(_s_section, ld::Atom::definitionRegular, ld::Atom::combineNever,
 							ld::Atom::scopeLinkageUnit, ld::Atom::typeStubHelper, 
-							symbolTableNotIn, false, false, false, ld::Atom::Alignment(1)), 
+							symbolTableNotIn, false, false, false, ld::Atom::Alignment(2)),
 				_stubTo(stubTo),
-				_fixup1(4, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64Branch26, helperHelper(pass)),
+				_fixup1(4, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64Branch26, helperHelper(pass, *this, stubToResolver)),
 				_fixup2(8, ld::Fixup::k1of2, ld::Fixup::kindSetLazyOffset, lazyPointer),
 				_fixup3(8, ld::Fixup::k2of2, ld::Fixup::kindStoreLittleEndian32)  { }
 				
@@ -168,7 +168,10 @@ public:
 	virtual ld::Fixup::iterator				fixupsEnd() const				{ return &((ld::Fixup*)&_fixup3)[1]; }
 
 private:
-	static ld::Atom* helperHelper(ld::passes::stubs::Pass& pass) {
+	static ld::Atom* helperHelper(ld::passes::stubs::Pass& pass, StubHelperAtom& stub, bool stubToResolver) {
+		// hack for resolvers in chained fixups.  StubHelper is not used by needs to be constructed, so use dummy values
+		if ( stubToResolver )
+			return &stub;
 		if ( pass.compressedHelperHelper == NULL ) 
 			pass.compressedHelperHelper = new StubHelperHelperAtom(pass);
 		return pass.compressedHelperHelper;
@@ -191,7 +194,7 @@ public:
 																							const ld::Atom& stubTo)
 				: ld::Atom(_s_section, ld::Atom::definitionRegular, ld::Atom::combineNever,
 							ld::Atom::scopeLinkageUnit, ld::Atom::typeStubHelper, 
-							symbolTableNotIn, false, false, false, ld::Atom::Alignment(1)), 
+							symbolTableNotIn, false, false, false, ld::Atom::Alignment(2)), 
 				_stubTo(stubTo),
 				_fixup1(24, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64Branch26, &stubTo),
 				_fixup2(28, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64Page21, lazyPointer),
@@ -247,7 +250,7 @@ public:
 							ld::Atom::scopeTranslationUnit, ld::Atom::typeLazyPointer, 
 							symbolTableNotIn, false, false, false, ld::Atom::Alignment(3)), 
 				_stubTo(stubTo),
-				_helper(pass, this, stubTo),
+				_helper(pass, this, stubTo, stubToResolver),
 				_resolverHelper(pass, this, stubTo),
 				_fixup1(0, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressLittleEndian64, 
 													stubToResolver ? &_resolverHelper : 
@@ -301,7 +304,7 @@ public:
 													bool stubToGlobalWeakDef, bool stubToResolver, bool weakImport, bool dataConstUsed)
 				: ld::Atom(_s_section, ld::Atom::definitionRegular, ld::Atom::combineNever,
 							ld::Atom::scopeLinkageUnit, ld::Atom::typeStub, 
-							symbolTableNotIn, false, false, false, ld::Atom::Alignment(1)), 
+							symbolTableNotIn, false, false, false, ld::Atom::Alignment(2)),
 				_stubTo(stubTo), 
 				_lazyPointer(pass, stubTo, stubToGlobalWeakDef, stubToResolver, weakImport, dataConstUsed),
 				_fixup1(0, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64Page21, &_lazyPointer),
@@ -338,12 +341,14 @@ ld::Section StubAtom::_s_section("__TEXT", "__stubs", ld::Section::typeStub);
 
 class NonLazyPointerAtom : public ld::Atom {
 public:
-				NonLazyPointerAtom(ld::passes::stubs::Pass& pass, const ld::Atom& stubTo)
+	NonLazyPointerAtom(ld::passes::stubs::Pass& pass, const ld::Atom& stubTo,
+					   bool weakImport)
 				: ld::Atom(_s_section, ld::Atom::definitionRegular, 
 							ld::Atom::combineNever, ld::Atom::scopeLinkageUnit, ld::Atom::typeNonLazyPointer, 
 							symbolTableNotIn, false, false, false, ld::Atom::Alignment(3)), 
 				_stubTo(stubTo),
 				_fixup1(0, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressLittleEndian64, &stubTo) {
+					_fixup1.weakImport = weakImport;
 					pass.addAtom(*this);
 				}
 
@@ -366,18 +371,19 @@ private:
 ld::Section NonLazyPointerAtom::_s_section("__DATA", "__got", ld::Section::typeNonLazyPointer);
 
 
-class KextStubAtom : public ld::Atom {
+class NonLazyStubAtom : public ld::Atom {
 public:
-				KextStubAtom(ld::passes::stubs::Pass& pass, const ld::Atom& stubTo)
+				NonLazyStubAtom(ld::passes::stubs::Pass& pass, const ld::Atom& stubTo,
+								bool weakImport)
 				: ld::Atom(_s_section, ld::Atom::definitionRegular, ld::Atom::combineNever,
 							ld::Atom::scopeLinkageUnit, ld::Atom::typeStub, 
-							symbolTableIn, false, false, false, ld::Atom::Alignment(1)), 
+							symbolTableNotIn, false, false, false, ld::Atom::Alignment(2)),
 				_stubTo(stubTo), 
-				_nonLazyPointer(pass, stubTo),
+				_nonLazyPointer(pass, stubTo, weakImport),
 				_fixup1(0, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64Page21, &_nonLazyPointer),
-				_fixup2(4, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64PageOff12, &_nonLazyPointer) { 
-					pass.addAtom(*this);
+				_fixup2(4, ld::Fixup::k1of1, ld::Fixup::kindStoreTargetAddressARM64PageOff12, &_nonLazyPointer) {
 					asprintf((char**)&_name, "%s.stub", _stubTo.name());
+					pass.addAtom(*this);
 				}
 
 	virtual const ld::File*					file() const					{ return _stubTo.file(); }
@@ -403,7 +409,7 @@ private:
 	static ld::Section						_s_section;
 };
 
-ld::Section KextStubAtom::_s_section("__TEXT", "__stubs", ld::Section::typeCode);
+ld::Section NonLazyStubAtom::_s_section("__TEXT", "__stubs", ld::Section::typeStub);
 
 
 } // namespace arm64

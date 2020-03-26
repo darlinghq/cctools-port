@@ -40,10 +40,15 @@ machocheck_LDADD = $(top_builddir)/ld64/src/3rd/libhelper.la
 
 ObjectDump_SOURCES = \
 	ObjectDump.cpp \
-	$(top_srcdir)/ld64/src/ld/debugline.c 
+	$(top_srcdir)/ld64/src/ld/PlatformSupport.cpp \
+	$(top_srcdir)/ld64/src/ld/debugline.c
+
 ObjectDump_LDADD =  \
 	$(top_builddir)/ld64/src/ld/parsers/libParsers.la \
-	$(LTO_LIB)
+	$(top_builddir)/ld64/src/3rd/BlocksRuntime/libBlocksRuntime.la  \
+	$(LTO_RPATH) \
+	$(LTO_LIB) \
+	$(DL_LIB) 
 
 dyldinfo_SOURCES = dyldinfo.cpp
 dyldinfo_LDADD = $(top_builddir)/ld64/src/3rd/libhelper.la

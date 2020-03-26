@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <unistd.h>
+#include <mutex> // ld64-port
 #include <mach-o/loader.h>
 
 #include <vector>
@@ -80,6 +81,7 @@ public:
 	virtual const char*							name() const		{ return "mach-o header and load commands"; }
 	virtual uint64_t							size() const;
 	virtual uint64_t							objectAddress() const { return _address; }
+
 	virtual void								copyRawContent(uint8_t buffer[]) const;
 
 	// overrides of HeaderAndLoadCommandsAbtract
@@ -110,13 +112,16 @@ private:
 	uint8_t*					copySingleSegmentLoadCommand(uint8_t* p) const;
 	uint8_t*					copySegmentLoadCommands(uint8_t* p, uint8_t* base) const;
 	uint8_t*					copyDyldInfoLoadCommand(uint8_t* p) const;
+	uint8_t*					copyExportsTrieLoadCommand(uint8_t* p) const;
+	uint8_t*					copyChainedFixupsLoadCommand(uint8_t* p) const;
 	uint8_t*					copySymbolTableLoadCommand(uint8_t* p, uint8_t* base) const;
 	uint8_t*					copyDynamicSymbolTableLoadCommand(uint8_t* p) const;
 	uint8_t*					copyDyldLoadCommand(uint8_t* p) const;
 	uint8_t*					copyDylibIDLoadCommand(uint8_t* p) const;
 	uint8_t*					copyRoutinesLoadCommand(uint8_t* p) const;
 	uint8_t*					copyUUIDLoadCommand(uint8_t* p) const;
-	uint8_t*					copyVersionLoadCommand(uint8_t* p) const;
+	uint8_t*					copyVersionLoadCommand(uint8_t* p, ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion) const;
+	uint8_t*					copyBuildVersionLoadCommand(uint8_t* p, ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion) const;
 	uint8_t*					copySourceVersionLoadCommand(uint8_t* p) const;
 	uint8_t*					copyThreadsLoadCommand(uint8_t* p) const;
 	uint8_t*					copyEntryPointLoadCommand(uint8_t* p) const;
@@ -160,6 +165,10 @@ private:
 	bool						_hasDataInCodeLoadCommand;
 	bool						_hasSourceVersionLoadCommand;
 	bool						_hasOptimizationHints;
+	bool						_hasExportsTrieLoadCommand;
+	bool						_hasChainedFixupsLoadCommand;
+	bool						_simulatorSupportDylib;
+	ld::VersionSet			 	_platforms;
 	uint32_t					_dylibLoadCommmandsCount;
 	uint32_t					_allowableClientLoadCommmandsCount;
 	uint32_t					_dyldEnvironExrasCount;
@@ -170,6 +179,7 @@ private:
 	mutable uint32_t			_linkeditCmdOffset;
 	mutable uint32_t			_symboltableCmdOffset;
 	std::vector< std::vector<const char*> >	 _linkerOptions;
+	std::unordered_set<uint64_t>&	_toolsVersions;
 	
 	static ld::Section			_s_section;
 	static ld::Section			_s_preload_section;
@@ -187,8 +197,9 @@ HeaderAndLoadCommandsAtom<A>::HeaderAndLoadCommandsAtom(const Options& opts, ld:
 				ld::Atom::definitionRegular, ld::Atom::combineNever, 
 				ld::Atom::scopeTranslationUnit, ld::Atom::typeUnclassified, 
 				ld::Atom::symbolTableNotIn, false, false, false, 
-				(opts.outputKind() == Options::kPreload) ? ld::Atom::Alignment(0) : ld::Atom::Alignment(12) ), 
-		_options(opts), _state(state), _writer(writer), _address(0), _uuidCmdInOutputBuffer(NULL), _linkeditCmdOffset(0), _symboltableCmdOffset(0)
+				(opts.outputKind() == Options::kPreload) ? ld::Atom::Alignment(0) : ld::Atom::Alignment(log2(opts.segmentAlignment())) ),
+		_options(opts), _state(state), _writer(writer), _address(0), _uuidCmdInOutputBuffer(NULL), _linkeditCmdOffset(0), _symboltableCmdOffset(0),
+		_toolsVersions(state.toolsVersions)
 {
 	bzero(_uuid, 16);
 	_hasDyldInfoLoadCommand = opts.makeCompressedDyldInfo();
@@ -198,10 +209,13 @@ HeaderAndLoadCommandsAtom<A>::HeaderAndLoadCommandsAtom(const Options& opts, ld:
 	_hasEntryPointLoadCommand = _options.needsEntryPointLoadCommand();
 	_hasEncryptionLoadCommand = opts.makeEncryptable();
 	_hasSplitSegInfoLoadCommand = opts.sharedRegionEligible();
-	_hasRoutinesLoadCommand = (opts.initFunctionName() != NULL);
+	_hasRoutinesLoadCommand = (opts.initFunctionName() != NULL) && (state.entryPoint != NULL);
 	_hasSymbolTableLoadCommand = true;
 	_hasUUIDLoadCommand = (opts.UUIDMode() != Options::kUUIDNone);
 	_hasOptimizationHints = (_state.someObjectHasOptimizationHints && (opts.outputKind() == Options::kObjectFile));
+	_hasExportsTrieLoadCommand = opts.makeChainedFixups() && opts.dyldLoadsOutput();
+	_hasChainedFixupsLoadCommand = opts.makeChainedFixups() && opts.dyldLoadsOutput();
+
 	switch ( opts.outputKind() ) {
 		case Options::kDynamicExecutable:
 		case Options::kDynamicLibrary:
@@ -244,9 +258,11 @@ HeaderAndLoadCommandsAtom<A>::HeaderAndLoadCommandsAtom(const Options& opts, ld:
 	}
 	_hasRPathLoadCommands = (_options.rpaths().size() != 0);
 	_hasSubFrameworkLoadCommand = (_options.umbrellaName() != NULL);
-	_hasVersionLoadCommand = _options.addVersionLoadCommand() ||
-							 (!state.objectFileFoundWithNoVersion && (_options.outputKind() == Options::kObjectFile)
-							 && ((_options.platform() != Options::kPlatformUnknown) || (state.derivedPlatformLoadCommand != 0)) );
+	_platforms = _options.platforms();
+	_hasVersionLoadCommand = _options.addVersionLoadCommand();
+	// in ld -r mode, only if all input .o files have load command, then add one to output
+	if ( !_hasVersionLoadCommand && (_options.outputKind() == Options::kObjectFile) && !state.objectFileFoundWithNoVersion )
+		_hasVersionLoadCommand = true;
 	_hasFunctionStartsLoadCommand = _options.addFunctionStarts();
 	_hasDataInCodeLoadCommand = _options.addDataInCodeInfo();
 	_hasSourceVersionLoadCommand = _options.needsSourceVersionLoadCommand();
@@ -392,7 +408,7 @@ void HeaderAndLoadCommandsAtom<A>::symbolTableCmdInfo(uint64_t &offset, uint64_t
 template <typename A>
 uint64_t HeaderAndLoadCommandsAtom<A>::size() const
 {
-	uint32_t sz = sizeof(macho_header<P>);
+	__block uint32_t sz = sizeof(macho_header<P>);
 	
 	sz += sizeof(macho_segment_command<P>) * this->segmentCount();
 	sz += sizeof(macho_section<P>) * this->nonHiddenSectionCount();
@@ -402,7 +418,13 @@ uint64_t HeaderAndLoadCommandsAtom<A>::size() const
 		
 	if ( _hasDyldInfoLoadCommand )
 		sz += sizeof(macho_dyld_info_command<P>);
-	
+
+	if ( _hasChainedFixupsLoadCommand )
+		sz += sizeof(linkedit_data_command);
+
+	if ( _hasExportsTrieLoadCommand )
+		sz += sizeof(linkedit_data_command);
+
 	if ( _hasSymbolTableLoadCommand )
 		sz += sizeof(macho_symtab_command<P>);
 		
@@ -418,9 +440,18 @@ uint64_t HeaderAndLoadCommandsAtom<A>::size() const
 	if ( _hasUUIDLoadCommand )
 		sz += sizeof(macho_uuid_command<P>);
 
-	if ( _hasVersionLoadCommand )
-		sz += sizeof(macho_version_min_command<P>);
-	
+	if ( _hasVersionLoadCommand ) {
+		if ( _hasVersionLoadCommand ) {
+			_options.platforms().forEach(^(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop) {
+				if (_options.shouldUseBuildVersion(platform, minVersion)) {
+					sz += alignedSize(sizeof(macho_build_version_command<P>) + sizeof(macho_build_tool_version<P>)*_toolsVersions.size());
+				} else {
+					sz += sizeof(macho_version_min_command<P>);
+				}
+			});
+		}
+	}
+
 	if ( _hasSourceVersionLoadCommand )
 		sz += sizeof(macho_source_version_command<P>);
 		
@@ -506,6 +537,12 @@ uint32_t HeaderAndLoadCommandsAtom<A>::commandsCount() const
 	if ( _hasDyldInfoLoadCommand )
 		++count;
 	
+	if ( _hasChainedFixupsLoadCommand )
+		++count;
+
+	if ( _hasExportsTrieLoadCommand )
+		++count;
+
 	if ( _hasSymbolTableLoadCommand )
 		++count;
 		
@@ -520,9 +557,10 @@ uint32_t HeaderAndLoadCommandsAtom<A>::commandsCount() const
 		
 	if ( _hasUUIDLoadCommand )
 		++count;
-	
-	if ( _hasVersionLoadCommand )
-		++count;
+
+	if ( _hasVersionLoadCommand ) {
+		count += _options.platforms().count();
+	}
 
 	if ( _hasSourceVersionLoadCommand )
 		++count;
@@ -630,10 +668,6 @@ uint32_t HeaderAndLoadCommandsAtom<A>::flags() const
 				bits |= MH_WEAK_DEFINES;
 			if ( _writer.usesWeakExternalSymbols || _state.hasWeakExternalSymbols )
 				bits |= MH_BINDS_TO_WEAK;
-			if ( _options.prebind() )
-				bits |= MH_PREBOUND;
-			if ( _options.splitSeg() )
-				bits |= MH_SPLIT_SEGS;
 			if ( (_options.outputKind() == Options::kDynamicLibrary) 
 					&& _writer._noReExportedDylibs 
 					&& _options.useSimplifiedDylibReExports() ) {
@@ -649,6 +683,8 @@ uint32_t HeaderAndLoadCommandsAtom<A>::flags() const
 				bits |= MH_NO_HEAP_EXECUTION;
 			if ( _options.markAppExtensionSafe() && (_options.outputKind() == Options::kDynamicLibrary) )
 				bits |= MH_APP_EXTENSION_SAFE;
+			if (_options.isSimulatorSupportDylib())
+				bits |= MH_SIM_SUPPORT;
 		}
 		if ( _options.hasExecutableStack() )
 			bits |= MH_ALLOW_STACK_EXECUTION;
@@ -676,7 +712,7 @@ uint32_t HeaderAndLoadCommandsAtom<x86>::cpuSubType() const
 template <>
 uint32_t HeaderAndLoadCommandsAtom<x86_64>::cpuSubType() const
 {
-	if ( (_options.outputKind() == Options::kDynamicExecutable) && (_state.cpuSubType == CPU_SUBTYPE_X86_64_ALL) && (_options.macosxVersionMin() >= ld::mac10_5) )
+	if ( (_options.outputKind() == Options::kDynamicExecutable) && (_state.cpuSubType == CPU_SUBTYPE_X86_64_ALL) && _options.platforms().minOS(ld::mac10_5) )
 		return (_state.cpuSubType | 0x80000000);
 	else
 		return _state.cpuSubType;
@@ -691,7 +727,7 @@ uint32_t HeaderAndLoadCommandsAtom<arm>::cpuSubType() const
 template <>
 uint32_t HeaderAndLoadCommandsAtom<arm64>::cpuSubType() const
 {
-	return CPU_SUBTYPE_ARM64_ALL;
+	return _state.cpuSubType;
 }
 
 
@@ -735,7 +771,7 @@ uint8_t* HeaderAndLoadCommandsAtom<A>::copySingleSegmentLoadCommand(uint8_t* p) 
 		if ( cmd->fileoff() == 0 )
 			cmd->set_fileoff(fsect->fileOffset);
 		cmd->set_vmsize(fsect->address + fsect->size - cmd->vmaddr());
-		if ( (fsect->type() != ld::Section::typeZeroFill) && (fsect->type() != ld::Section::typeTentativeDefs) )
+		if ( !sectionTakesNoDiskSpace(fsect) )
 			cmd->set_filesize(fsect->fileOffset + fsect->size - cmd->fileoff());
 		++msect;
 	}
@@ -750,13 +786,16 @@ struct SegInfo {
 	uint32_t									nonSectCreateSections;
 	uint32_t									maxProt;
 	uint32_t									initProt;
+	uint32_t									flags;
 	std::vector<ld::Internal::FinalSection*>	sections;
 };
 
 
 SegInfo::SegInfo(const char* n, const Options& opts) 
-	: segName(n), nonHiddenSectionCount(0), nonSectCreateSections(0), maxProt(opts.maxSegProtection(n)), initProt(opts.initialSegProtection(n))
-{ 
+	: segName(n), nonHiddenSectionCount(0), nonSectCreateSections(0), maxProt(opts.maxSegProtection(n)), initProt(opts.initialSegProtection(n)), flags(0)
+{
+	if ( opts.readOnlyDataSegment(n) )
+		flags = SG_READ_ONLY;
 }
 
 
@@ -835,6 +874,9 @@ uint32_t HeaderAndLoadCommandsAtom<A>::sectionFlags(ld::Internal::FinalSection* 
 			return S_DTRACE_DOF;
 		case ld::Section::typeUnwindInfo:
 			return S_REGULAR;
+		case ld::Section::typeThreadStarts:
+		case ld::Section::typeChainStarts:
+			return S_REGULAR;
 		case ld::Section::typeObjCClassRefs:
 		case ld::Section::typeObjC2CategoryList:
 			return S_REGULAR | S_ATTR_NO_DEAD_STRIP;
@@ -901,6 +943,8 @@ uint32_t HeaderAndLoadCommandsAtom<A>::sectionFlags(ld::Internal::FinalSection* 
 			return S_REGULAR | S_ATTR_DEBUG;
 		case ld::Section::typeSectCreate:
 			return S_REGULAR;
+		case ld::Section::typeInitOffsets:
+			return S_INIT_FUNC_OFFSETS;
 	}
 	return S_REGULAR;
 }
@@ -984,7 +1028,7 @@ uint8_t* HeaderAndLoadCommandsAtom<A>::copySegmentLoadCommands(uint8_t* p, uint8
 		segCmd->set_maxprot(si.maxProt);
 		segCmd->set_initprot(si.initProt);
 		segCmd->set_nsects(si.nonHiddenSectionCount);
-		segCmd->set_flags(si.nonSectCreateSections ? 0 : SG_NORELOC); // FIXME, really should check all References
+		segCmd->set_flags(si.flags | (si.nonSectCreateSections ? 0 : SG_NORELOC)); // FIXME, really should check all References
 		if ( strcmp(segCmd->segname(), "__LINKEDIT") == 0 )
 			_linkeditCmdOffset = p - base;
 		p += sizeof(macho_segment_command<P>);
@@ -1100,6 +1144,34 @@ uint8_t* HeaderAndLoadCommandsAtom<A>::copyDyldInfoLoadCommand(uint8_t* p) const
 	return p + sizeof(macho_dyld_info_command<P>);
 }
 
+template <typename A>
+uint8_t* HeaderAndLoadCommandsAtom<A>::copyExportsTrieLoadCommand(uint8_t* p) const
+{
+	// build LC_DYLD_EXPORTS_TRIE command
+	linkedit_data_command*  cmd = (linkedit_data_command*)p;
+
+	cmd->cmd 		= LC_DYLD_EXPORTS_TRIE;
+	cmd->cmdsize	= sizeof(linkedit_data_command);
+	cmd->dataoff 	= _writer.exportSection->fileOffset;
+	cmd->datasize   = _writer.exportSection->size;
+
+	return p + sizeof(linkedit_data_command);
+}
+
+template <typename A>
+uint8_t* HeaderAndLoadCommandsAtom<A>::copyChainedFixupsLoadCommand(uint8_t* p) const
+{
+	// build LC_DYLD_CHAINED_FIXUPS command
+	linkedit_data_command*  cmd = (linkedit_data_command*)p;
+
+	cmd->cmd 		= LC_DYLD_CHAINED_FIXUPS;
+	cmd->cmdsize	= sizeof(linkedit_data_command);
+	cmd->dataoff 	= _writer.chainInfoSection->fileOffset;
+	cmd->datasize   = _writer.chainInfoSection->size;
+
+	return p + sizeof(linkedit_data_command);
+}
+
 
 template <typename A>
 uint8_t* HeaderAndLoadCommandsAtom<A>::copyDyldLoadCommand(uint8_t* p) const
@@ -1167,46 +1239,45 @@ uint8_t* HeaderAndLoadCommandsAtom<A>::copyUUIDLoadCommand(uint8_t* p) const
 
 
 template <typename A>
-uint8_t* HeaderAndLoadCommandsAtom<A>::copyVersionLoadCommand(uint8_t* p) const
+uint8_t* HeaderAndLoadCommandsAtom<A>::copyVersionLoadCommand(uint8_t* p, ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion) const
 {
 	macho_version_min_command<P>* cmd = (macho_version_min_command<P>*)p;
-	switch (_options.platform()) {
-		case Options::kPlatformUnknown:
-			assert(_state.derivedPlatformLoadCommand != 0 && "unknown platform");
-			cmd->set_cmd(_state.derivedPlatformLoadCommand);
-			cmd->set_cmdsize(sizeof(macho_version_min_command<P>));
-			cmd->set_version(_state.minOSVersion);
-			cmd->set_sdk(0);
-			break;
-		case Options::kPlatformOSX:
-			cmd->set_cmd(LC_VERSION_MIN_MACOSX);
-			cmd->set_cmdsize(sizeof(macho_version_min_command<P>));
-			cmd->set_version(_state.minOSVersion);
-			cmd->set_sdk(_options.sdkVersion());
-			break;
-		case Options::kPlatformiOS:
-			cmd->set_cmd(LC_VERSION_MIN_IPHONEOS);
-			cmd->set_cmdsize(sizeof(macho_version_min_command<P>));
-			cmd->set_version(_state.minOSVersion);
-			cmd->set_sdk(_options.sdkVersion());
-			break;
-		case Options::kPlatformWatchOS:
-			cmd->set_cmd(LC_VERSION_MIN_WATCHOS);
-			cmd->set_cmdsize(sizeof(macho_version_min_command<P>));
-			cmd->set_version(_state.minOSVersion);
-			cmd->set_sdk(_options.sdkVersion());
-			break;
-#if SUPPORT_APPLE_TV
-		case Options::kPlatform_tvOS:
-			cmd->set_cmd(LC_VERSION_MIN_TVOS);
-			cmd->set_cmdsize(sizeof(macho_version_min_command<P>));
-			cmd->set_version(_state.minOSVersion);
-			cmd->set_sdk(_options.sdkVersion());
-			break;
-#endif
-	}
+	const PlatformInfo& info = platformInfo(platform);
+	assert(info.loadCommandIfNotUsingBuildVersionLC != 0 && "platform requires LC_BUILD_VERSION");
+	cmd->set_cmd(info.loadCommandIfNotUsingBuildVersionLC);
+	cmd->set_cmdsize(sizeof(macho_version_min_command<P>));
+	cmd->set_version(minVersion);
+	cmd->set_sdk(sdkVersion);
 	return p + sizeof(macho_version_min_command<P>);
 }
+
+
+
+template <typename A>
+	uint8_t* HeaderAndLoadCommandsAtom<A>::copyBuildVersionLoadCommand(uint8_t* p, ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion) const
+{
+	macho_build_version_command<P>* cmd = (macho_build_version_command<P>*)p;
+
+	// temp hack until iOSMac SDK version plumbed through
+	if (platform == ld::Platform::iOSMac)
+		sdkVersion = 0x000D0000;
+
+	cmd->set_cmd(LC_BUILD_VERSION);
+	cmd->set_cmdsize(alignedSize(sizeof(macho_build_version_command<P>) + sizeof(macho_build_tool_version<P>)*_toolsVersions.size()));
+	cmd->set_platform((uint32_t)platform);
+	cmd->set_minos(minVersion);
+	cmd->set_sdk(sdkVersion);
+	cmd->set_ntools(_toolsVersions.size());
+	macho_build_tool_version<P>* tools = (macho_build_tool_version<P>*)(p + sizeof(macho_build_version_command<P>));
+	for (uint64_t tool : _toolsVersions) {
+		tools->set_tool((uint64_t)tool >> 32);
+		tools->set_version(tool & 0xFFFFFFFF);
+		++tools;
+	}
+
+	return p + cmd->cmdsize();
+}
+
 
 template <typename A>
 uint8_t* HeaderAndLoadCommandsAtom<A>::copySourceVersionLoadCommand(uint8_t* p) const
@@ -1359,14 +1430,21 @@ uint8_t* HeaderAndLoadCommandsAtom<A>::copyDylibLoadCommand(uint8_t* p, const ld
 {
 	uint32_t sz = alignedSize(sizeof(macho_dylib_command<P>) + strlen(dylib->installPath()) + 1);
 	macho_dylib_command<P>* cmd = (macho_dylib_command<P>*)p;
+	bool weakLink = dylib->forcedWeakLinked() || dylib->allSymbolsAreWeakImported();
+	bool upward = dylib->willBeUpwardDylib() && _options.useUpwardDylibs();
+	bool reExport = dylib->willBeReExported() && _options.useSimplifiedDylibReExports();
+	if ( weakLink && upward )
+		warning("cannot weak upward link.  Dropping weak for %s", dylib->installPath());
+	if ( weakLink && reExport )
+		warning("cannot weak re-export a dylib.  Dropping weak for %s", dylib->installPath());
 	if ( dylib->willBeLazyLoadedDylib() )
 		cmd->set_cmd(LC_LAZY_LOAD_DYLIB);
-	else if ( dylib->forcedWeakLinked() || dylib->allSymbolsAreWeakImported() )
-		cmd->set_cmd(LC_LOAD_WEAK_DYLIB);
-	else if ( dylib->willBeReExported() && _options.useSimplifiedDylibReExports() )
+	else if ( reExport )
 		cmd->set_cmd(LC_REEXPORT_DYLIB);
-	else if ( dylib->willBeUpwardDylib() && _options.useUpwardDylibs() )
+	else if ( upward )
 		cmd->set_cmd(LC_LOAD_UPWARD_DYLIB);
+	else if ( weakLink )
+		cmd->set_cmd(LC_LOAD_WEAK_DYLIB);
 	else
 		cmd->set_cmd(LC_LOAD_DYLIB);
 	cmd->set_cmdsize(sz);
@@ -1509,7 +1587,6 @@ uint8_t* HeaderAndLoadCommandsAtom<A>::copyOptimizationHintsLoadCommand(uint8_t*
 	return p + sizeof(macho_linkedit_data_command<P>);
 }
 
-
 template <typename A>
 void HeaderAndLoadCommandsAtom<A>::copyRawContent(uint8_t buffer[]) const
 {
@@ -1526,7 +1603,7 @@ void HeaderAndLoadCommandsAtom<A>::copyRawContent(uint8_t buffer[]) const
 	mh->set_flags(this->flags());
 
 	// copy load commands
-	uint8_t* p = &buffer[sizeof(macho_header<P>)];
+	__block uint8_t* p = &buffer[sizeof(macho_header<P>)];
 	
 	if ( _options.outputKind() == Options::kObjectFile )
 		p = this->copySingleSegmentLoadCommand(p);
@@ -1539,6 +1616,12 @@ void HeaderAndLoadCommandsAtom<A>::copyRawContent(uint8_t buffer[]) const
 	if ( _hasDyldInfoLoadCommand )
 		p = this->copyDyldInfoLoadCommand(p);
 		
+	if ( _hasChainedFixupsLoadCommand )
+		p = this->copyChainedFixupsLoadCommand(p);
+
+	if ( _hasExportsTrieLoadCommand )
+		p = this->copyExportsTrieLoadCommand(p);
+
 	if ( _hasSymbolTableLoadCommand )
 		p = this->copySymbolTableLoadCommand(p, buffer);
 
@@ -1553,9 +1636,16 @@ void HeaderAndLoadCommandsAtom<A>::copyRawContent(uint8_t buffer[]) const
 		
 	if ( _hasUUIDLoadCommand )
 		p = this->copyUUIDLoadCommand(p);
-	
-	if ( _hasVersionLoadCommand )
-		p = this->copyVersionLoadCommand(p);
+
+	if ( _hasVersionLoadCommand ) {
+		_options.platforms().forEach(^(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop) {
+			if (_options.shouldUseBuildVersion(platform, minVersion)) {
+				p = this->copyBuildVersionLoadCommand(p, platform, minVersion, sdkVersion);
+			} else {
+				p = this->copyVersionLoadCommand(p, platform, minVersion, sdkVersion);
+			}
+		});
+	}
 
 	if ( _hasSourceVersionLoadCommand )
 		p = this->copySourceVersionLoadCommand(p);

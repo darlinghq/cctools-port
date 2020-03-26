@@ -4,6 +4,12 @@ export LC_ALL=C
 pushd "${0%/*}" &>/dev/null
 
 PLATFORM=$(uname -s)
+OPERATING_SYSTEM=$(uname -o || echo "-")
+
+if [ $OPERATING_SYSTEM == "Android" ]; then
+  export CC="clang -D__ANDROID_API__=26"
+  export CXX="clang++ -D__ANDROID_API__=26"
+fi
 
 if [ -z "$LLVM_DSYMUTIL" ]; then
     LLVM_DSYMUTIL=llvm-dsymutil
@@ -59,7 +65,9 @@ function git_clone_repository
     fi
 
     if [ ! -d $directory ]; then
-        git clone $url --depth 1
+        local args=""
+        test "$branch" = "master" && args="--depth 1"
+        git clone $url $args
     fi
 
     pushd $directory &>/dev/null
@@ -67,7 +75,7 @@ function git_clone_repository
     git reset --hard
     git clean -fdx
     git checkout $branch
-    git pull
+    git pull origin $branch
 
     popd &>/dev/null
 }
@@ -129,7 +137,7 @@ which $LLVM_DSYMUTIL &>/dev/null
 if [ $? -eq 0 ]; then
     case $($LLVM_DSYMUTIL --version | \
            grep "LLVM version" | head -1 | awk '{print $3}') in
-        3.8*|3.9*|4.0*|5.0*) OK=1 ;;
+        3.8*|3.9*|4.0*|5.0*|6.0*|7.0*|8.0*|9.0*) OK=1 ;;
     esac
 fi
 set -e
@@ -139,7 +147,7 @@ if [ $OK -eq 1 ]; then
     pushd $TARGETDIR/bin &>/dev/null
     ln -sf $TRIPLE-lipo lipo
     popd &>/dev/null
-else
+elif ! which dsymutil &>/dev/null; then
     echo "int main(){return 0;}" | cc -xc -O2 -o $TARGETDIR/bin/dsymutil -
 fi
 
@@ -172,7 +180,7 @@ echo "*** building apple-libtapi ***"
 echo ""
 
 pushd tmp &>/dev/null
-git_clone_repository https://github.com/tpoechtrager/apple-libtapi.git master
+git_clone_repository https://github.com/tpoechtrager/apple-libtapi.git 1000.10.8
 pushd apple-libtapi &>/dev/null
 INSTALLPREFIX=$TARGETDIR ./build.sh
 ./install.sh
@@ -185,7 +193,6 @@ echo ""
 
 pushd ../../cctools &>/dev/null
 git clean -fdx &>/dev/null || true
-./autogen.sh
 popd &>/dev/null
 
 pushd tmp &>/dev/null

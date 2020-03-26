@@ -1,6 +1,7 @@
 #ifdef LTO_SUPPORT
 
 #include <stdio.h>
+#include <strings.h> /* cctools-port: For bcmp, bzero ... */
 #include <stdlib.h>
 #include <libc.h>
 #include <sys/file.h>
@@ -62,7 +63,7 @@ size_t size)
 	 *"llvm bitcode file" could be in an archive or fat file.
 	 */
 
-	if(is_llvm_bitcode_from_memory(addr, size, &arch_flag,
+	if(is_llvm_bitcode_from_memory(addr, (uint32_t)size, &arch_flag,
 				       &ofile->lto) != 0){
 	    ofile->lto_cputype = arch_flag.cputype;
 	    ofile->lto_cpusubtype = arch_flag.cpusubtype;
@@ -299,6 +300,14 @@ const char *target_triple)
 	else if(strncmp(target_triple, "arm64", n) == 0){
 	    arch_flag->cputype = CPU_TYPE_ARM64;
 	    arch_flag->cpusubtype = CPU_SUBTYPE_ARM64_ALL;
+	}
+	else if(strncmp(target_triple, "arm64e", n) == 0){
+	    arch_flag->cputype = CPU_TYPE_ARM64;
+	    arch_flag->cpusubtype = CPU_SUBTYPE_ARM64E;
+	}
+	else if(strncmp(target_triple, "arm64_32", n) == 0){
+	    arch_flag->cputype = CPU_TYPE_ARM64_32;
+	    arch_flag->cpusubtype = CPU_SUBTYPE_ARM64_32_V8;
 	}
 	else{
 	    return(0);

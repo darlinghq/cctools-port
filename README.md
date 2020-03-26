@@ -1,35 +1,37 @@
-# Apple cctools port for Linux, *BSD and Windows (Cygwin) #
+# Apple cctools and ld64 port for Linux, *BSD and macOS #
 
-Current Version: 895 + ld64-274.2.  
+Current Version: cctools: 949.0.1, ld64: 512.4.  
 Originally ported by [cjacker](http://ios-toolchain-based-on-clang-for-linux.googlecode.com).
 
 ## SUPPORTED HOSTS ##
 
 **SUPPORTED OPERATING SYSTEMS:**
 
-Linux, FreeBSD, NetBSD, OpenBSD, DragonFlyBSD,  
-Windows (Cygwin), Mac OS X and iOS
+Linux, Android (Termux), FreeBSD,  
+Mac OS X, iOS, OpenBSD and NetBSD
 
 **SUPPORTED HOST ARCHITECTURES:**
 
-x86, x86_64, arm
-
-Untested, but compiles:
-
-aarch64, ppc, ppc64
+x86, x86_64, arm, arm64/aarch64
 
 ## SUPPORTED TARGET ARCHITECTURES ##
 
-armv6, armv7, armv7s, arm64, i386, x86_64,  
-x86_64h, armv6m, armv7k, armv7m and armv7em
+armv6, armv7, armv7s, arm64, arm64e,  
+arm64_32 (untested), i386, x86_64, x86_64h,  
+armv6m, armv7k, armv7m and armv7em
+
+arm64e requires [Apple LLVM/Clang](https://github.com/apple/llvm-project).
 
 ## SUPPORTED TARGET OPERATING SYSTEMS ##
 
-Mac OS X, iOS, watchOS (untested) and tvOS (untested)
+macOS, iOS, tvOS, watchOS, bridgeOS, Mac Catalyst,  
+iOS Simluator, watchOS Simulator, DriverKit
+
+Not all of the targets have been tested.
 
 ## DEPENDENCIES ##
 
-`Clang 3.2+ or gcc/g++/gcc-objc 4.8+`
+`Clang 3.4+` 
 
 SDKs with .tdb stubs (>= Xcode 7) require the TAPI library to be installed.  
 => https://github.com/tpoechtrager/apple-libtapi
@@ -74,4 +76,4 @@ If you get compile errors because of `unistd.h`, then please run
 
 ## TRAVIS CI ##
 
-[![Build Status](https://travis-ci.org/tpoechtrager/cctools-port.svg?branch=master)](https://travis-ci.org/tpoechtrager/cctools-port)
+[![Build Status](https://travis-ci.org/tpoechtrager/cctools-port.svg?branch=949.0.1-ld64-512.4)](https://travis-ci.org/tpoechtrager/cctools-port)

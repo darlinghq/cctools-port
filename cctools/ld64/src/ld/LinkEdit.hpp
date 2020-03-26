@@ -103,6 +103,10 @@ public:
 		_data.push_back(byte);
 	}
 	
+	void append_mem(const void* mem, size_t len) {
+		_data.insert(_data.end(), (uint8_t*)mem, (uint8_t*)mem + len);
+	}
+
 	static unsigned int	uleb128_size(uint64_t value) {
 		uint32_t result = 0;
 		do {
@@ -130,7 +134,9 @@ public:
 	virtual void								copyRawContent(uint8_t buffer[]) const; 
 
 	virtual void								encode() const = 0;
-	
+
+	const uint8_t*								rawContent() const { return this->_encodedData.start(); }
+
 												LinkEditAtom(const Options& opts, ld::Internal& state, 
 																OutputFile& writer, const ld::Section& sect,
 																unsigned int pointerSize)
@@ -176,6 +182,8 @@ public:
 	virtual void								encode() const;
 
 private:
+	void						encodeV1() const;
+
 	struct rebase_tmp
 	{
 		rebase_tmp(uint8_t op, uint64_t p1, uint64_t p2=0) : opcode(op), operand1(p1), operand2(p2) {}
@@ -204,8 +212,28 @@ void RebaseInfoAtom<A>::encode() const
 
 	// sort rebase info by type, then address
 	std::vector<OutputFile::RebaseInfo>& info = this->_writer._rebaseInfo;
+	if (info.empty())
+		return;
+
 	std::sort(info.begin(), info.end());
 	
+	// use encoding based on target minOS
+	if ( _options.useLinkedListBinding() && !this->_writer._hasUnalignedFixup ) {
+		if ( info.back()._type != REBASE_TYPE_POINTER )
+			throw "unsupported rebase type with linked list opcodes";
+		// As the binding and rebasing are both linked lists, just use the binds
+		// to do everything.
+	} else {
+		encodeV1();
+	}
+}
+
+
+template <typename A>
+void RebaseInfoAtom<A>::encodeV1() const
+{
+	std::vector<OutputFile::RebaseInfo>& info = this->_writer._rebaseInfo;
+
 	// convert to temp encoding that can be more easily optimized
 	std::vector<rebase_tmp> mid;
 	uint64_t curSegStart = 0;
@@ -388,6 +416,9 @@ public:
 
 
 private:
+	void						encodeV1() const;
+	void						encodeV2() const;
+
 	typedef typename A::P						P;
 	typedef typename A::P::E					E;
 	typedef typename A::P::uint_t				pint_t;
@@ -412,10 +443,22 @@ ld::Section BindingInfoAtom<A>::_s_section("__LINKEDIT", "__binding", ld::Sectio
 template <typename A>
 void BindingInfoAtom<A>::encode() const
 {
+	// use encoding based on target minOS
+	if ( _options.useLinkedListBinding() && !this->_writer._hasUnalignedFixup ) {
+		encodeV2();
+	} else {
+		encodeV1();
+	}
+}
+
+
+template <typename A>
+void BindingInfoAtom<A>::encodeV1() const
+{
 	// sort by library, symbol, type, then address
 	std::vector<OutputFile::BindingInfo>& info = this->_writer._bindingInfo;
 	std::sort(info.begin(), info.end());
-	
+
 	// convert to temp encoding that can be more easily optimized
 	std::vector<binding_tmp> mid;
 	uint64_t curSegStart = 0;
@@ -593,6 +636,229 @@ void BindingInfoAtom<A>::encode() const
 	}
 	
 	// align to pointer size
+	this->_encodedData.pad_to_size(sizeof(pint_t));
+
+	this->_encoded = true;
+
+	if (log) fprintf(stderr, "total binding info size = %ld\n", this->_encodedData.size());
+}
+
+template <typename A>
+void BindingInfoAtom<A>::encodeV2() const
+{
+	std::vector<OutputFile::BindingInfo>& bindInfo = this->_writer._bindingInfo;
+	std::vector<OutputFile::RebaseInfo>& rebaseInfo = this->_writer._rebaseInfo;
+	const static bool log = false;
+
+	std::sort(bindInfo.begin(), bindInfo.end());
+
+	// convert to temp encoding that can be more easily optimized
+	std::vector<binding_tmp> mid;
+	uint64_t curSegStart = 0;
+	uint64_t curSegEnd = 0;
+	uint32_t curSegIndex = 0;
+	int ordinal = 0x80000000;
+	const char* symbolName = NULL;
+	uint8_t type = 0;
+	uint64_t address = (uint64_t)(-1);
+	int64_t addend = 0;
+	uint64_t numBinds = (uint64_t)(-1);
+	for (std::vector<OutputFile::BindingInfo>::iterator it = bindInfo.begin(); it != bindInfo.end(); ++it) {
+		bool madeChange = false;
+		if ( ordinal != it->_libraryOrdinal ) {
+			if ( it->_libraryOrdinal <= 0 ) {
+				// special lookups are encoded as negative numbers in BindingInfo
+				mid.push_back(binding_tmp(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM, it->_libraryOrdinal));
+			}
+			else if ( it->_libraryOrdinal <= 15 ) {
+				mid.push_back(binding_tmp(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, it->_libraryOrdinal));
+			}
+			else {
+				mid.push_back(binding_tmp(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB, it->_libraryOrdinal));
+			}
+			ordinal = it->_libraryOrdinal;
+			madeChange = true;
+		}
+		if ( symbolName != it->_symbolName ) {
+			mid.push_back(binding_tmp(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM, it->_flags, 0, it->_symbolName));
+			symbolName = it->_symbolName;
+			madeChange = true;
+		}
+		if ( type != it->_type ) {
+			if ( it->_type != BIND_TYPE_POINTER )
+				throw "unsupported bind type with linked list opcodes";
+			mid.push_back(binding_tmp(BIND_OPCODE_SET_TYPE_IMM, it->_type));
+			type = it->_type;
+			madeChange = true;
+		}
+		if ( address != it->_address ) {
+			// Note, we don't push the addresses here.  That is all done later with the threaded chains
+			if ( (it->_address < curSegStart) || ( it->_address >= curSegEnd) ) {
+				if ( ! this->_writer.findSegment(this->_state, it->_address, &curSegStart, &curSegEnd, &curSegIndex) )
+					throw "binding address outside range of any segment";
+			}
+			address = it->_address;
+		}
+		if ( addend != it->_addend ) {
+			mid.push_back(binding_tmp(BIND_OPCODE_SET_ADDEND_SLEB, it->_addend));
+			addend = it->_addend;
+			madeChange = true;
+		}
+
+		if (madeChange) {
+			++numBinds;
+			mid.push_back(binding_tmp(BIND_OPCODE_DO_BIND, 0));
+		}
+		it->_threadedBindOrdinal = numBinds;
+	}
+
+	// We can only support 2^16 bind ordinals.
+	if ( (numBinds > 0x10000) && (numBinds != (uint64_t)(-1)) )
+		throwf("too many binds (%llu).  The limit is 65536", numBinds);
+
+	// Now that we have the bind ordinal table populate, set the page starts.
+
+	std::vector<int64_t>& threadedRebaseBindIndices = this->_writer._threadedRebaseBindIndices;
+	threadedRebaseBindIndices.reserve(bindInfo.size() + rebaseInfo.size());
+
+	for (int64_t i = 0, e = rebaseInfo.size(); i != e; ++i)
+		threadedRebaseBindIndices.push_back(-i);
+
+	for (int64_t i = 0, e = bindInfo.size(); i != e; ++i)
+		threadedRebaseBindIndices.push_back(i + 1);
+
+	// Now sort the entries by address.
+	std::sort(threadedRebaseBindIndices.begin(), threadedRebaseBindIndices.end(),
+			  [&rebaseInfo, &bindInfo](int64_t indexA, int64_t indexB) {
+				  if (indexA == indexB)
+					  return false;
+				  uint64_t addressA = indexA <= 0 ? rebaseInfo[-indexA]._address : bindInfo[indexA - 1]._address;
+				  uint64_t addressB = indexB <= 0 ? rebaseInfo[-indexB]._address : bindInfo[indexB - 1]._address;
+				  assert(addressA != addressB);
+				  return addressA < addressB;
+			  });
+
+	curSegStart = 0;
+	curSegEnd = 0;
+	curSegIndex = 0;
+	uint64_t prevPageIndex = 0;
+	for (int64_t entryIndex : threadedRebaseBindIndices) {
+		OutputFile::RebaseInfo* rebase = nullptr;
+		OutputFile::BindingInfo* bind = nullptr;
+		uint64_t address = 0;
+		if (entryIndex <= 0) {
+			rebase = &rebaseInfo[-entryIndex];
+			address = rebase->_address;
+		} else {
+			bind = &bindInfo[entryIndex - 1];
+			address = bind->_address;
+		}
+		assert((address & 7) == 0);
+
+		bool newSegment = false;
+		if ( (address < curSegStart) || ( address >= curSegEnd) ) {
+			// Start of a new segment.
+			if ( ! this->_writer.findSegment(this->_state, address, &curSegStart, &curSegEnd, &curSegIndex) )
+				throw "binding address outside range of any segment";
+			newSegment = true;
+		}
+
+		// At this point we know we have the page starts array space reserved
+		// so set the page start for this entry if we haven't got one already.
+		uint64_t pageIndex = ( address - curSegStart ) / 4096;
+		if ( newSegment || (pageIndex != prevPageIndex) ) {
+			mid.push_back(binding_tmp(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB, curSegIndex, address - curSegStart));
+			mid.push_back(binding_tmp(BIND_OPCODE_THREADED | BIND_SUBOPCODE_THREADED_APPLY, 0));
+		}
+		prevPageIndex = pageIndex;
+	}
+	mid.push_back(binding_tmp(BIND_OPCODE_DONE, 0));
+
+	// convert to compressed encoding
+	this->_encodedData.reserve(bindInfo.size()*2);
+
+	// First push the total number of binds so that we can allocate space for this in dyld.
+	if ( log ) fprintf(stderr, "BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB(%lld)\n", numBinds + 1);
+	this->_encodedData.append_byte(BIND_OPCODE_THREADED | BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB);
+	this->_encodedData.append_uleb128(numBinds + 1);
+
+	bool done = false;
+	for (typename std::vector<binding_tmp>::iterator it = mid.begin(); !done && it != mid.end() ; ++it) {
+		switch ( it->opcode ) {
+			case BIND_OPCODE_DONE:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_DONE()\n");
+				done = true;
+				break;
+			case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_DYLIB_ORDINAL_IMM(%lld)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | it->operand1);
+				break;
+			case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB(%lld)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+				this->_encodedData.append_uleb128(it->operand1);
+				break;
+			case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_DYLIB_SPECIAL_IMM(%lld)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | (it->operand1 & BIND_IMMEDIATE_MASK));
+				break;
+			case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM(0x%0llX, %s)\n", it->operand1, it->name);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | it->operand1);
+				this->_encodedData.append_string(it->name);
+				break;
+			case BIND_OPCODE_SET_TYPE_IMM:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_TYPE_IMM(%lld)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_TYPE_IMM | it->operand1);
+				break;
+			case BIND_OPCODE_SET_ADDEND_SLEB:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_ADDEND_SLEB(%lld)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_ADDEND_SLEB);
+				this->_encodedData.append_sleb128(it->operand1);
+				break;
+			case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB(%lld, 0x%llX)\n", it->operand1, it->operand2);
+				this->_encodedData.append_byte(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | it->operand1);
+				this->_encodedData.append_uleb128(it->operand2);
+				break;
+			case BIND_OPCODE_ADD_ADDR_ULEB:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_ADD_ADDR_ULEB(0x%llX)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_ADD_ADDR_ULEB);
+				this->_encodedData.append_uleb128(it->operand1);
+				break;
+			case BIND_OPCODE_DO_BIND:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_DO_BIND()\n");
+				this->_encodedData.append_byte(BIND_OPCODE_DO_BIND);
+				break;
+			case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB(0x%llX)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB);
+				this->_encodedData.append_uleb128(it->operand1);
+				break;
+			case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED(%lld=0x%llX)\n", it->operand1, it->operand1*sizeof(pint_t));
+				this->_encodedData.append_byte(BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED | it->operand1 );
+				break;
+			case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
+				if ( log ) fprintf(stderr, "BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB(%lld, %lld)\n", it->operand1, it->operand2);
+				this->_encodedData.append_byte(BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB);
+				this->_encodedData.append_uleb128(it->operand1);
+				this->_encodedData.append_uleb128(it->operand2);
+				break;
+			case BIND_OPCODE_THREADED | BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB:
+				if ( log ) fprintf(stderr, "BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB(%lld)\n", it->operand1);
+				this->_encodedData.append_byte(BIND_OPCODE_THREADED | BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB);
+				this->_encodedData.append_uleb128(it->operand1);
+				break;
+			case BIND_OPCODE_THREADED | BIND_SUBOPCODE_THREADED_APPLY:
+				this->_encodedData.append_byte(BIND_OPCODE_THREADED | BIND_SUBOPCODE_THREADED_APPLY);
+				if ( log ) fprintf(stderr, "BIND_SUBOPCODE_THREADED_APPLY()\n");
+				break;
+		}
+	}
+
+	// align to pointer size
+	this->_encodedData.append_byte(BIND_OPCODE_DONE);
 	this->_encodedData.pad_to_size(sizeof(pint_t));
 
 	this->_encoded = true;
@@ -914,6 +1180,172 @@ void LazyBindingInfoAtom<A>::encode() const
 
 
 
+
+template <typename A>
+class ChainedInfoAtom : public LinkEditAtom
+{
+public:
+												ChainedInfoAtom(const Options& opts, ld::Internal& state, OutputFile& writer)
+													: LinkEditAtom(opts, state, writer, _s_section, sizeof(pint_t)) { _encoded = true; }
+
+	// overrides of ld::Atom
+	virtual const char*							name() const		{ return "fixup chain info"; }
+	// overrides of LinkEditAtom
+	virtual void								encode() const;
+
+private:
+	typedef typename A::P						P;
+	typedef typename A::P::E					E;
+	typedef typename A::P::uint_t				pint_t;
+
+
+	static ld::Section			_s_section;
+};
+
+template <typename A>
+ld::Section ChainedInfoAtom<A>::_s_section("__LINKEDIT", "__chainfixups", ld::Section::typeLinkEdit, true);
+
+
+
+template <typename A>
+void ChainedInfoAtom<A>::encode() const
+{
+	this->_encodedData.bytes().reserve(1024);
+
+	uint16_t format = DYLD_CHAINED_IMPORT;
+	if ( _writer._chainedFixupBinds.hasHugeAddends() )
+		format = DYLD_CHAINED_IMPORT_ADDEND64;
+	else if ( _writer._chainedFixupBinds.hasLargeAddends() )
+		format = DYLD_CHAINED_IMPORT_ADDEND;
+	dyld_chained_fixups_header header;
+	header.fixups_version = 0;
+	header.starts_offset  = sizeof(dyld_chained_fixups_header);
+	header.imports_offset = 0;	// fixed up later
+	header.symbols_offset = 0;	// fixed up later
+	header.imports_count  = _writer._chainedFixupBinds.count();
+	header.imports_format = format;
+	header.symbols_format = 0;
+	this->_encodedData.append_mem(&header, sizeof(dyld_chained_fixups_header));
+	const unsigned segsHeaderOffset = this->_encodedData.size();
+
+	// write starts table
+	dyld_chained_starts_in_image segs;
+	segs.seg_count 	        = _writer._chainedFixupSegments.size();
+	segs.seg_info_offset[0] = 0;
+	this->_encodedData.append_mem(&segs, sizeof(dyld_chained_starts_in_image));
+	uint32_t emptyOffset = 0;
+	for (unsigned i=1; i < _writer._chainedFixupSegments.size(); ++i)
+		this->_encodedData.append_mem(&emptyOffset, sizeof(uint32_t)); // fixed up later if segment used
+	unsigned segIndex = 0;
+	uint64_t baseAddress = 0;
+	uint64_t maxRebaseAddress = 0;
+	for (OutputFile::ChainedFixupSegInfo& segInfo : _writer._chainedFixupSegments) {
+		if ( strcmp(segInfo.name, "__TEXT") == 0 )
+			baseAddress = segInfo.startAddr;
+		else if ( strcmp(segInfo.name, "__LINKEDIT") == 0 )
+			maxRebaseAddress = (segInfo.startAddr - baseAddress + 0x00100000-1) & -0x00100000; // align to 1MB
+	}
+	_writer._chainedFixupBinds.setMaxRebase(maxRebaseAddress);
+	for (OutputFile::ChainedFixupSegInfo& segInfo : _writer._chainedFixupSegments) {
+		if ( !segInfo.pages.empty() ) {
+			uint32_t startBytesPerPage = sizeof(uint16_t);
+			if ( segInfo.pointerFormat == DYLD_CHAINED_PTR_32 )
+				startBytesPerPage = 32; // guesstimate 32-bit chains go ~0.5K before needing a new start
+			dyld_chained_starts_in_segment aSeg;
+			aSeg.size 			   = sizeof(dyld_chained_starts_in_segment) + segInfo.pages.size()*startBytesPerPage;
+			aSeg.page_size 		   = segInfo.pageSize;
+			aSeg.pointer_format    = segInfo.pointerFormat;
+			aSeg.segment_offset    = segInfo.startAddr - baseAddress;
+			aSeg.max_valid_pointer = maxRebaseAddress;
+			aSeg.page_count 	   = segInfo.pages.size();
+			dyld_chained_starts_in_image* segHeader = (dyld_chained_starts_in_image*)(this->_encodedData.start()+segsHeaderOffset);
+			segHeader->seg_info_offset[segIndex] = this->_encodedData.size() - segsHeaderOffset;
+			this->_encodedData.append_mem(&aSeg, sizeof(dyld_chained_starts_in_segment)-sizeof(uint16_t));
+			std::vector<uint16_t> 	segChainOverflows;
+			for (OutputFile::ChainedFixupPageInfo& pageInfo : segInfo.pages) {
+				uint16_t startOffset = pageInfo.fixupOffsets.empty() ? DYLD_CHAINED_PTR_START_NONE : pageInfo.fixupOffsets.front();
+				this->_encodedData.append_mem(&startOffset, sizeof(startOffset));
+			}
+			if ( segInfo.pointerFormat == DYLD_CHAINED_PTR_32 ) {
+				// zero out chain overflow area
+				long padBytes = (startBytesPerPage-2) * segInfo.pages.size();
+				for (long i=0; i < padBytes; ++i)
+					this->_encodedData.append_byte(0);
+			}
+		}
+		++segIndex;
+	}
+
+	// build imports and symbol table
+	__block std::vector<dyld_chained_import>  		  imports;
+	__block std::vector<dyld_chained_import_addend>   importsAddend;
+	__block std::vector<dyld_chained_import_addend64> importsAddend64;
+	__block std::vector<char>                		  stringPool;
+	stringPool.push_back('\0');
+	_writer._chainedFixupBinds.forEachBind(^(unsigned int bindOrdinal, const ld::Atom* importAtom, uint64_t addend) {
+		uint32_t libOrdinal;
+		bool isBind = _writer.needsBind(importAtom, nullptr, nullptr, nullptr, &libOrdinal);
+		assert(isBind);
+		const char*            symName 		= importAtom->name();
+		if ( header.imports_format == DYLD_CHAINED_IMPORT ) {
+			dyld_chained_import   anImport;
+			anImport.lib_ordinal = libOrdinal;
+			anImport.weak_import = importAtom->weakImported();
+			anImport.name_offset = stringPool.size();
+			imports.push_back(anImport);
+		}
+		else if ( header.imports_format == DYLD_CHAINED_IMPORT_ADDEND ) {
+			dyld_chained_import_addend  anImportA;
+			anImportA.lib_ordinal = libOrdinal;
+			anImportA.weak_import = importAtom->weakImported();
+			anImportA.name_offset = stringPool.size();
+			anImportA.addend      = addend;
+			importsAddend.push_back(anImportA);
+		}
+		else {
+			dyld_chained_import_addend64  anImportA64;
+			anImportA64.lib_ordinal = libOrdinal;
+			anImportA64.weak_import = importAtom->weakImported();
+			anImportA64.name_offset = stringPool.size();
+			anImportA64.addend      = addend;
+			importsAddend64.push_back(anImportA64);
+		}
+		stringPool.insert(stringPool.end(), symName, &symName[strlen(symName)+1]);
+	});
+
+	// write imports and symbol table
+	dyld_chained_fixups_header* chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
+	switch ( header.imports_format ) {
+		case DYLD_CHAINED_IMPORT:
+			this->_encodedData.pad_to_size(4);
+			chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
+			chainHeader->imports_offset = this->_encodedData.size();
+			this->_encodedData.append_mem(&imports[0], sizeof(dyld_chained_import)*imports.size());
+			break;
+		case DYLD_CHAINED_IMPORT_ADDEND:
+			this->_encodedData.pad_to_size(4);
+			chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
+			chainHeader->imports_offset = this->_encodedData.size();
+			this->_encodedData.append_mem(&importsAddend[0], sizeof(dyld_chained_import_addend)*importsAddend.size());
+			break;
+		case DYLD_CHAINED_IMPORT_ADDEND64:
+			this->_encodedData.pad_to_size(8);
+			chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
+			chainHeader->imports_offset = this->_encodedData.size();
+			this->_encodedData.append_mem(&importsAddend64[0], sizeof(dyld_chained_import_addend64)*importsAddend64.size());
+			break;
+	}
+	chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
+	chainHeader->symbols_offset = this->_encodedData.size();
+	this->_encodedData.append_mem(&stringPool[0], stringPool.size());
+
+	// align to pointer size
+	this->_encodedData.pad_to_size(sizeof(pint_t));
+
+	this->_encoded = true;
+}
+
+
 template <typename A>
 class ExportInfoAtom : public LinkEditAtom
 {
@@ -998,7 +1430,7 @@ void ExportInfoAtom<A>::encode() const
 				entry.flags |= EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
 			entry.other = this->_writer.compressedOrdinalForAtom(atom);
 			if ( entry.other == BIND_SPECIAL_DYLIB_SELF ) {
-				warning("not adding explict export for symbol %s because it is already re-exported from dylib %s", entry.name, atom->file()->path());
+				warning("not adding explict export for symbol %s because it is already re-exported from dylib %s", entry.name, atom->safeFilePath());
 				continue;
 			}
 			if ( atom->isAlias() ) {
@@ -1135,6 +1567,12 @@ void SplitSegInfoV1Atom<x86_64>::addSplitSegInfo(uint64_t address, ld::Fixup::Ki
 		case ld::Fixup::kindStoreTargetAddressLittleEndian64:
 			_64bitPointerLocations.push_back(address);
 			break;
+#if SUPPORT_ARCH_arm64e
+		case ld::Fixup::kindStoreLittleEndianAuth64:
+		case ld::Fixup::kindStoreTargetAddressLittleEndianAuth64:
+			assert(false);
+			break;
+#endif
 		default:
 			warning("codegen at address 0x%08llX prevents image from working in dyld shared cache", address);
 			break;
@@ -1206,6 +1644,12 @@ void SplitSegInfoV1Atom<arm64>::addSplitSegInfo(uint64_t address, ld::Fixup::Kin
 		case ld::Fixup::kindStoreTargetAddressLittleEndian64:
 			_64bitPointerLocations.push_back(address);
 			break;
+#if SUPPORT_ARCH_arm64e
+		case ld::Fixup::kindStoreLittleEndianAuth64:
+		case ld::Fixup::kindStoreTargetAddressLittleEndianAuth64:
+			warning("authenticated pointer at address 0x%08llX prevents image from working in dyld shared cache", address);
+			break;
+#endif
 		default:
 			warning("codegen at address 0x%08llX prevents image from working in dyld shared cache", address);
 			break;

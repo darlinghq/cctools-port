@@ -29,7 +29,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -112,7 +111,7 @@ public:
 	
 						SymbolTable(const Options& opts, std::vector<const ld::Atom*>& ibt);
 
-	bool				add(const ld::Atom& atom, bool ignoreDuplicates);
+	bool				add(const ld::Atom& atom, Options::Treatment duplicates);
 	IndirectBindingSlot	findSlotForName(const char* name);
 	IndirectBindingSlot	findSlotForContent(const ld::Atom* atom, const ld::Atom** existingAtom);
 	IndirectBindingSlot	findSlotForReferences(const ld::Atom* atom, const ld::Atom** existingAtom);
@@ -127,7 +126,8 @@ public:
 	byNameIterator		begin()								{ return byNameIterator(_byNameTable.begin(),_indirectBindingTable); }
 	byNameIterator		end()								{ return byNameIterator(_byNameTable.end(),_indirectBindingTable); }
 	void				printStatistics();
-	
+	void				removeDeadUndefs(std::vector<const ld::Atom *>& allAtoms, const std::unordered_set<const ld::Atom*>& keep);
+
 	// from ld::IndirectBindingTable
 	virtual const char*			indirectName(IndirectBindingSlot slot) const;
 	virtual const ld::Atom*		indirectAtom(IndirectBindingSlot slot) const;
@@ -137,14 +137,16 @@ public:
 
 
 private:
-	bool					addByName(const ld::Atom& atom, bool ignoreDuplicates);
+	bool					addByName(const ld::Atom& atom, Options::Treatment duplicates);
 	bool					addByContent(const ld::Atom& atom);
 	bool					addByReferences(const ld::Atom& atom);
 	void					markCoalescedAway(const ld::Atom* atom);
     
     // Tracks duplicated symbols. Each call adds file to the list of files defining symbol.
     // The file list is uniqued per symbol, so calling multiple times for the same symbol/file pair is permitted.
-    void                    addDuplicateSymbol(const char *symbol, const ld::Atom* atom);
+    void                    addDuplicateSymbol(DuplicateSymbols& dups, const char* symbol, const ld::Atom* atom);
+	void 					addDuplicateSymbolError(const char* name, const ld::Atom* atom);
+	void 					addDuplicateSymbolWarning(const char* name, const ld::Atom* atom);
 
 	const Options&					_options;
 	NameToSlot						_byNameTable;
@@ -163,8 +165,8 @@ private:
 	std::vector<const ld::Atom*>&	_indirectBindingTable;
 	bool							_hasExternalTentativeDefinitions;
 	
-    DuplicateSymbols                _duplicateSymbols;
-
+    DuplicateSymbols                _duplicateSymbolErrors;
+    DuplicateSymbols                _duplicateSymbolWarnings;
 };
 
 } // namespace tool 

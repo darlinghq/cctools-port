@@ -234,6 +234,12 @@ bool Layout::Comparer::operator()(const ld::Atom* left, const ld::Atom* right)
 			return rightLast;
 	}
 #endif
+
+	// sort cold functions to end
+	bool leftCold  = left->cold();
+	bool rightCold = right->cold();
+	if ( leftCold != rightCold )
+		return rightCold;
 	
 	// sort by .o order
 	const ld::File* leftFile = left->file();
@@ -530,7 +536,7 @@ void Layout::buildOrdinalOverrideMap()
 					AtomToOrdinal::iterator pos = _ordinalOverrideMap.find(nextAtom);
 					if ( pos == _ordinalOverrideMap.end() ) {
 						_ordinalOverrideMap[nextAtom] = index++;
-						if (_s_log ) fprintf(stderr, "override ordinal %u assigned to %s in cluster from %s\n", index, nextAtom->name(), nextAtom->file()->path());
+						if (_s_log ) fprintf(stderr, "override ordinal %u assigned to %s in cluster from %s\n", index, nextAtom->name(), nextAtom->safeFilePath());
 					}
 					else {
 						if (_s_log ) fprintf(stderr, "could not order %s as %u because it was already laid out earlier by %s as %u\n",
@@ -540,7 +546,7 @@ void Layout::buildOrdinalOverrideMap()
 			}
 			else {
 				_ordinalOverrideMap[atom] = index;
-				if (_s_log ) fprintf(stderr, "override ordinal %u assigned to %s from %s\n", index, atom->name(), atom->file()->path());
+				if (_s_log ) fprintf(stderr, "override ordinal %u assigned to %s from %s\n", index, atom->name(), atom->safeFilePath());
 			}
 			++matchCount;
 		}
@@ -617,10 +623,20 @@ void Layout::doPass()
 	// sort atoms in each section
 	for (std::vector<ld::Internal::FinalSection*>::iterator sit=_state.sections.begin(); sit != _state.sections.end(); ++sit) {
 		ld::Internal::FinalSection* sect = *sit;
-		if ( sect->type() ==  ld::Section::typeTempAlias )
-			continue;
-		if ( log ) fprintf(stderr, "sorting section %s\n", sect->sectionName());
-		std::sort(sect->atoms.begin(), sect->atoms.end(), _comparer);
+		switch ( sect->type() ) {
+			case ld::Section::typeTempAlias:
+			case ld::Section::typeStub:
+			case ld::Section::typeLazyPointer:
+			case ld::Section::typeLazyPointerClose:
+			case ld::Section::typeStubClose:
+			case ld::Section::typeNonLazyPointer:
+				// these sections are already sorted by pass that created them
+				break;
+			default:
+				if ( log ) fprintf(stderr, "sorting section %s\n", sect->sectionName());
+				std::sort(sect->atoms.begin(), sect->atoms.end(), _comparer);
+				break;
+		}
 	}
 
 	if ( log ) {

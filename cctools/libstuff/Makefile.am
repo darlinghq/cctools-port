@@ -43,5 +43,8 @@ libstuff_la_SOURCES =  \
 	unix_standard_mode.c  \
 	version_number.c  \
 	writeout.c \
-	coff_bytesex.c
+	write64.c \
+	coff_bytesex.c \
+	args.c
+
 

@@ -29,6 +29,7 @@ the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* cctools-port: For bcmp, bzero ... */
 #include <assert.h>
 #include <libc.h>
 #include "input-file.h"
@@ -151,7 +152,7 @@ char *where,	/* Where to place 1st character of new buffer. */
 int *give_next_size)
 {
   char *	return_value;	/* -> Last char of what we read, + 1. */
-  register int	size;
+  register size_t	size;
 
   *give_next_size = BUFFER_SIZE;
   if (f_in == (FILE *)0)

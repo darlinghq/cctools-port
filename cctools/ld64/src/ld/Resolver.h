@@ -29,7 +29,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -64,7 +63,7 @@ public:
 								  _haveLLVMObjs(false),
 								  _completedInitialObjectFiles(false),
 								  _ltoCodeGenFinished(false),
-								  _haveAliases(false) {}
+								  _haveAliases(false), _havellvmProfiling(false) {}
 								
 
 		virtual void		doAtom(const ld::Atom&);
@@ -135,6 +134,7 @@ private:
 	bool							_completedInitialObjectFiles;
 	bool							_ltoCodeGenFinished;
 	bool							_haveAliases;
+	bool							_havellvmProfiling;
 };
 
 

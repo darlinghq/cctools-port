@@ -31,7 +31,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -57,7 +56,7 @@ namespace tool {
 class InputFiles : public ld::dylib::File::DylibHandler
 {
 public:
-								InputFiles(Options& opts, const char** archName);
+								InputFiles(Options& opts);
 
 	// implementation from ld::dylib::File::DylibHandler
 	virtual ld::dylib::File*	findDylib(const char* installPath, const ld::dylib::File* fromDylib, bool speculative);
@@ -73,9 +72,7 @@ public:
 	void						dylibs(ld::Internal& state);
 	
 	void						archives(ld::Internal& state);
-	
-	bool						inferredArch() const { return _inferredArch; }
-	
+
 	void						addLinkerOptionLibraries(ld::Internal& state, ld::File::AtomHandler& handler);
 	void						createIndirectDylibs();
 
@@ -89,7 +86,7 @@ public:
 	
 private:
 	void						inferArchitecture(Options& opts, const char** archName);
-	const char*					fileArch(const uint8_t* p, unsigned len);
+	const char* 				extractFileInfo(const uint8_t* p, unsigned len, const char* path, ld::Platform& platform);
 	ld::File*					makeFile(const Options::FileInfo& info, bool indirectDylib);
 	ld::File*					addDylib(ld::dylib::File* f,        const Options::FileInfo& info);
 	void						logTraceInfo (const char* format, ...) const;
@@ -110,7 +107,7 @@ private:
 	static void					parseWorkerThread(InputFiles *inputFiles);
 	void						startThread(void (*threadFunc)(InputFiles *)) const;
 
-	typedef std::unordered_map<const char*, ld::dylib::File*, CStringHash, CStringEquals>	InstallNameToDylib;
+	typedef std::map<std::string, ld::dylib::File*>	InstallNameToDylib;
 
 	const Options&				_options;
 	std::vector<ld::File*>		_inputFiles;
@@ -119,7 +116,6 @@ private:
 	InstallNameToDylib			_installPathToDylibs;
 	std::set<ld::dylib::File*>	_allDylibs;
 	ld::dylib::File*			_bundleLoader;
-	bool						_inferredArch;
     struct strcompclass {
         bool operator() (const char *a, const char *b) const { return ::strcmp(a, b) < 0; }
     };

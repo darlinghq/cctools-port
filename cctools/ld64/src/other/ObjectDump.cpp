@@ -39,6 +39,9 @@
 #include <algorithm>
 #endif
 
+const ld::VersionSet ld::File::_platforms;
+
+
 static bool			sDumpContent= true;
 static bool			sDumpStabs	= false;
 static bool			sSort		= true;
@@ -400,11 +403,13 @@ struct AtomSorter
 					rightString = (char*)cstringAtom->rawContentPointer();
 				}
 			}
-			assert(leftString != NULL);
-			assert(rightString != NULL);
-			diff = strcmp(leftString, rightString);
-			if ( diff != 0 )
-				return (diff < 0);
+			if ( leftString != rightString ) {
+				assert(leftString != NULL);
+				assert(rightString != NULL);
+				diff = strcmp(leftString, rightString);
+				if ( diff != 0 )
+					return (diff < 0);
+			}
 		}
 		else if ( left->section().type() == ld::Section::typeLiteral4 ) {
 			// if literal sort by content
@@ -558,6 +563,9 @@ const char*	dumper::attributeString(const ld::Atom& atom)
 	if ( atom.isAlias() )
 		strcat(buffer, "alias ");
 		
+	if ( atom.cold() )
+		strcat(buffer, "cold ");
+
 	if ( atom.contentType() == ld::Atom::typeResolver )
 		strcat(buffer, "resolver ");
 		
@@ -808,6 +816,7 @@ void dumper::dumpFixup(const ld::Fixup* ref)
 		case ld::Fixup::kindStoreThumbHigh16:
 			printf(", then store high-16 in Thumb movt");
 			break;
+#if SUPPORT_ARCH_arm64
 		case ld::Fixup::kindStoreARM64Branch26:
 			printf(", then store as ARM64 26-bit pcrel branch");
 			break;
@@ -847,6 +856,7 @@ void dumper::dumpFixup(const ld::Fixup* ref)
 		case ld::Fixup::kindStoreARM64PCRelToGOT:
 			printf(", then store as 32-bit delta to GOT entry");
 			break;
+#endif
 		case ld::Fixup::kindDtraceExtra:
 			printf("dtrace static probe extra info");
 			break;
@@ -868,12 +878,14 @@ void dumper::dumpFixup(const ld::Fixup* ref)
 		case ld::Fixup::kindStoreThumbDtraceIsEnableSiteClear:
 			printf("Thumb dtrace static is-enabled site");
 			break;
+#if SUPPORT_ARCH_arm64
 		case ld::Fixup::kindStoreARM64DtraceCallSiteNop:
 			printf("ARM64 dtrace static probe site");
 			break;
 		case ld::Fixup::kindStoreARM64DtraceIsEnableSiteClear:
 			printf("ARM64 dtrace static is-enabled site");
 			break;
+#endif
 		case ld::Fixup::kindLazyTarget:
 			printf("lazy reference to external symbol %s", referenceTargetAtomName(ref));
 			break;
@@ -991,6 +1003,7 @@ void dumper::dumpFixup(const ld::Fixup* ref)
 		case ld::Fixup::kindSetTargetTLVTemplateOffsetLittleEndian64:
 			printf("tlv template offset of %s", referenceTargetAtomName(ref));
 			break;
+#if SUPPORT_ARCH_arm64
 		case ld::Fixup::kindStoreTargetAddressARM64Branch26:
 			printf("ARM64 store 26-bit pcrel branch to %s", referenceTargetAtomName(ref));
 			break;
@@ -1024,6 +1037,7 @@ void dumper::dumpFixup(const ld::Fixup* ref)
 		case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadNowLeaPageOff12:
 			printf("ARM64 store 12-bit page offset of lea for TLV of %s", referenceTargetAtomName(ref));
 			break;
+#endif
 		//default:
 		//	printf("unknown fixup");
 		//	break;
@@ -1247,6 +1261,9 @@ static ld::relocatable::File* createReader(const char* path)
 	objOpts.forceDwarfConversion = false;
 	objOpts.verboseOptimizationHints = true;
 	objOpts.armUsesZeroCostExceptions = true;
+#if SUPPORT_ARCH_arm64e
+	objOpts.supportsAuthenticatedPointers = true;
+#endif
 	objOpts.subType				= sPreferredSubArch;
 	objOpts.treateBitcodeAsData  = false;
 	objOpts.usingBitcode		= true;
@@ -1254,8 +1271,9 @@ static ld::relocatable::File* createReader(const char* path)
 	if ( ! foundFatSlice ) {
 		cpu_type_t archOfObj;
 		cpu_subtype_t subArchOfObj;
-		Options::Platform platform;
-		if ( mach_o::relocatable::isObjectFile(p, &archOfObj, &subArchOfObj, &platform) ) {
+		ld::Platform platform;
+		uint32_t minOS;
+		if ( mach_o::relocatable::isObjectFile(p, fileLen, &archOfObj, &subArchOfObj, &platform, &minOS) ) {
 			objOpts.architecture = archOfObj;
 			objOpts.subType = subArchOfObj;
 		}
