@@ -23,7 +23,8 @@ add_definitions(-U__APPLE__
 	-D__DARWIN_UNIX03
 	-DPROGRAM_PREFIX="x86_64-apple-darwin11-"
 	-DSTDC_HEADERS=1 -DHAVE_SYS_TYPES_H=1 -DHAVE_SYS_STAT_H=1 -DHAVE_STDLIB_H=1 -DHAVE_STRING_H=1 -DHAVE_MEMORY_H=1 -DHAVE_STRINGS_H=1 -DHAVE_INTTYPES_H=1 -DHAVE_STDINT_H=1 -DHAVE_UNISTD_H=1 -DHAVE_DLFCN_H=1
-	-Du_short=uint16_t)
+	-DHAVE_BCMP -DHAVE_BZERO -DHAVE_BCOPY -DHAVE_INDEX -DHAVE_RINDEX
+	-Du_short=uint16_t -Dmode_t=__mode_t)
 
 # i386 has a different CPU type/subtype, but Darling only supports x86_64
 if (TARGET_x86_64 OR TARGET_i386)
@@ -53,6 +54,7 @@ set(ld64_sources
 	./ld/Resolver.cpp
 	./ld/ld.cpp
 	./ld/Snapshot.cpp
+	./ld/PlatformSupport.cpp
 	./ld/passes/branch_island.cpp
 	./ld/passes/compact_unwind.cpp
 	./ld/passes/code_dedup.cpp
@@ -66,7 +68,10 @@ set(ld64_sources
 	./ld/passes/huge.cpp
 	./ld/passes/bitcode_bundle.cpp
 	./ld/passes/objc.cpp
+	./ld/passes/inits.cpp
+	./ld/passes/thread_starts.cpp
 	./3rd/md5.c
+	./3rd/mkpath_np.c
 	./3rd/strlcat.c
 	./3rd/BlocksRuntime/runtime.c
 	./3rd/BlocksRuntime/data.c

@@ -17,6 +17,7 @@ add_definitions(-U__APPLE__
 	-U_POSIX_C_SOURCE
 	-DPROGRAM_PREFIX="x86_64-apple-darwin11-"
 	-DSTDC_HEADERS=1 -DHAVE_SYS_TYPES_H=1 -DHAVE_SYS_STAT_H=1 -DHAVE_STDLIB_H=1 -DHAVE_STRING_H=1 -DHAVE_MEMORY_H=1 -DHAVE_STRINGS_H=1 -DHAVE_INTTYPES_H=1 -DHAVE_STDINT_H=1 -DHAVE_UNISTD_H=1 -DHAVE_DLFCN_H=1
+	-DHAVE_BCMP -DHAVE_BZERO -DHAVE_BCOPY -DHAVE_INDEX -DHAVE_RINDEX
 	-Du_short=uint16_t -Du_int=uint32_t
 	-DPACKAGE_NAME="lipo"
 	-DRANLIB
@@ -55,6 +56,8 @@ add_library(stuff OBJECT
 	../libstuff/get_arch_from_host.c
 	../libstuff/set_arch_flag_name.c
 	../libstuff/get_toc_byte_sex.c
+	../libstuff/write64.c
+	../libstuff/args.c
 )
 
 set(lipo_sources
@@ -63,6 +66,7 @@ set(lipo_sources
 )
 
 add_executable(lipo ${lipo_sources})
+target_link_libraries(lipo -lm)
 
 set(ranlib_sources
 	libtool.c
