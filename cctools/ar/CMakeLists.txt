@@ -54,3 +54,11 @@ set(ar_sources
 
 add_executable(x86_64-apple-darwin11-ar ${ar_sources})
 
+set(ranlib_sources
+	../misc/libtool.c
+	$<TARGET_OBJECTS:stuff>
+)
+add_executable(ranlib ${ranlib_sources})
+set_property(TARGET ranlib APPEND_STRING PROPERTY COMPILE_FLAGS " -DRANLIB")
+set_target_properties(ranlib PROPERTIES OUTPUT_NAME "x86_64-apple-darwin11-ranlib")
+

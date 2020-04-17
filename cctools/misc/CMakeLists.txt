@@ -69,8 +69,3 @@ set(lipo_sources
 add_executable(lipo ${lipo_sources})
 target_link_libraries(lipo m)
 
-set(ranlib_sources
-	libtool.c
-	$<TARGET_OBJECTS:stuff>
-)
-add_executable(ranlib ${ranlib_sources})
