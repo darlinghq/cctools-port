@@ -85,6 +85,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* cctools-port: For bcmp, bzero ... */
 #include <ctype.h>
 #include <libc.h>
 #include <dlfcn.h>
@@ -96,6 +97,7 @@
 #include "stuff/errors.h"
 #include "stuff/allocate.h"
 #include "stuff/guess_short_name.h"
+#include "stuff/write64.h"
 #ifdef LTO_SUPPORT
 #include "stuff/lto.h"
 #include <xar/xar.h>
@@ -162,7 +164,7 @@ struct process_flags {
 };
 
 struct symbol {
-    char *name;
+    const char *name;
     char *indr_name;
     struct nlist_64 nl;
 };
@@ -501,7 +503,7 @@ struct ofile *ofile,
 char *arch_name,
 void *cookie)
 {
-    uint32_t ncmds, mh_flags;
+    uint32_t ncmds, mh_flags, mh_filetype;
     struct cmd_flags *cmd_flags;
     struct process_flags process_flags;
     uint32_t i, j, k;
@@ -529,10 +531,6 @@ void *cookie)
 
 	/* cctools-port start */
 	memset(&process_flags, '\0', sizeof(process_flags));
-#ifdef LTO_SUPPORT
-	llvm_bundle_pointer = NULL;
-	llvm_bundle_size = 0;
-#endif /* LTO_SUPPORT */
 	/* cctools-port end */
 
 	cmd_flags = (struct cmd_flags *)cookie;
@@ -549,6 +547,11 @@ void *cookie)
 	process_flags.nlibs = 0;
 	process_flags.lib_names = NULL;
 
+#ifdef LTO_SUPPORT
+	llvm_bundle_pointer = NULL;
+	llvm_bundle_size = 0;
+#endif /* LTO_SUPPORT */
+
 	if(ofile->mh == NULL && ofile->mh64 == NULL){
 #ifdef LTO_SUPPORT
 	    if(ofile->lto != NULL)
@@ -562,10 +565,12 @@ void *cookie)
 	if(ofile->mh != NULL){
 	    ncmds = ofile->mh->ncmds;
 	    mh_flags = ofile->mh->flags;
+	    mh_filetype = ofile->mh->filetype;
 	}
 	else{
 	    ncmds = ofile->mh64->ncmds;
 	    mh_flags = ofile->mh64->flags;
+	    mh_filetype = ofile->mh64->filetype;
 	}
 	for(i = 0; i < ncmds; i++){
 	    if(st == NULL && lc->cmd == LC_SYMTAB){
@@ -669,6 +674,10 @@ void *cookie)
 		    for(j = 0; j < sg64->nsects; j++){
 			if(strcmp((s64 + j)->sectname, SECT_TEXT) == 0 &&
 			   strcmp((s64 + j)->segname, SEG_TEXT) == 0)
+			    process_flags.text_nsect = k + 1;
+			else if(mh_filetype == MH_KEXT_BUNDLE &&
+			   strcmp((s64 + j)->sectname, SECT_TEXT) == 0 &&
+			   strcmp((s64 + j)->segname, "__TEXT_EXEC") == 0)
 			    process_flags.text_nsect = k + 1;
 			else if(strcmp((s64 + j)->sectname, SECT_DATA) == 0 &&
 				strcmp((s64 + j)->segname, SEG_DATA) == 0)
@@ -1073,7 +1082,7 @@ struct cmd_flags *cmd_flags)
 	    return;
 
 	xar_fd = mkstemp(xar_filename);
-	if(write(xar_fd, llvm_bundle_pointer, llvm_bundle_size) !=
+	if(write64(xar_fd, llvm_bundle_pointer, llvm_bundle_size) !=
 	        llvm_bundle_size){
 	    if(ofile->xar_member_name != NULL)
 		system_error("Can't write (__LLVM,__bundle) section contents "
@@ -1768,6 +1777,11 @@ char *arch_name)
 	       (symbols[i].nl.n_desc & N_ALT_ENTRY) == N_ALT_ENTRY)
 		    printf("[alt entry] ");
 
+	    if(ofile->mh_filetype == MH_OBJECT &&
+	       ((symbols[i].nl.n_type & N_TYPE) != N_UNDF) &&
+	       (symbols[i].nl.n_desc & N_COLD_FUNC) == N_COLD_FUNC)
+		    printf("[cold func] ");
+
 	    if((symbols[i].nl.n_desc & N_ARM_THUMB_DEF) == N_ARM_THUMB_DEF)
 		    printf("[Thumb] ");
 
@@ -1818,7 +1832,8 @@ struct value_diff *value_diffs)
 {
     uint32_t i;
     unsigned char c;
-    char *ta_xfmt, *i_xfmt, *spaces, *dashes, *p;
+    char *ta_xfmt, *i_xfmt, *spaces, *dashes;
+    const char *p;
 
 	if(ofile->mh != NULL ||
 	   (ofile->lto != NULL &&
@@ -1872,7 +1887,7 @@ struct value_diff *value_diffs)
 		    else{
 			printf(" (indirect for ");
 			printf(ta_xfmt, symbols[i].nl.n_value);
-			printf(" %s)\n", symbols[i].indr_name);
+			printf(" %s)\n", symbols[i].nl.n_value + strings);
 		    }
 		}
 		else

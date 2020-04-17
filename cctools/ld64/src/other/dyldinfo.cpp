@@ -32,6 +32,7 @@
 #include <errno.h>
 
 #include <vector>
+#include <tuple>
 #include <set>
 #include <unordered_set>
 
@@ -117,7 +118,8 @@ private:
 	const uint8_t*								printSharedRegionV2ToSectionOffset(const uint8_t* p, const uint8_t* end);
 	const uint8_t*								printSharedRegionV2Kind(const uint8_t* p, const uint8_t* end);
 
-	pint_t										relocBase();
+	pint_t										localRelocBase();
+	pint_t										externalRelocBase();
 	const char*									relocTypeName(uint8_t r_type);
 	uint8_t										segmentIndexForAddress(pint_t addr);
 	void										processExportGraphNode(const uint8_t* const start, const uint8_t* const end,  
@@ -236,6 +238,7 @@ bool DyldInfoPrinter<x86_64>::validFile(const uint8_t* fileContent)
 		case MH_DYLIB_STUB:
 		case MH_BUNDLE:
 		case MH_DYLINKER:
+		case MH_KEXT_BUNDLE:
 			return true;
 	}
 	return false;
@@ -256,6 +259,7 @@ bool DyldInfoPrinter<arm>::validFile(const uint8_t* fileContent)
 		case MH_DYLIB_STUB:
 		case MH_BUNDLE:
 		case MH_DYLINKER:
+		case MH_KEXT_BUNDLE:
 			return true;
 	}
 	return false;
@@ -274,13 +278,19 @@ bool DyldInfoPrinter<arm64>::validFile(const uint8_t* fileContent)
 	switch (header->filetype()) {
 		case MH_EXECUTE:
 		case MH_DYLIB:
+		case MH_DYLIB_STUB:
 		case MH_BUNDLE:
 		case MH_DYLINKER:
+		case MH_KEXT_BUNDLE:
+		case MH_PRELOAD:
 			return true;
+		default:
+			return false;
 	}
 	return false;
 }
 #endif
+
 
 template <typename A>
 DyldInfoPrinter<A>::DyldInfoPrinter(const uint8_t* fileContent, uint32_t fileLength, const char* path, bool printArch)
@@ -323,8 +333,13 @@ DyldInfoPrinter<A>::DyldInfoPrinter(const uint8_t* fileContent, uint32_t fileLen
 				{
 				const macho_segment_command<P>* segCmd = (const macho_segment_command<P>*)cmd;
 				fSegments.push_back(segCmd);
-				if ( (segCmd->fileoff() == 0) && (segCmd->filesize() != 0) )
-					fBaseAddress = segCmd->vmaddr();
+				if (fHeader->filetype() == MH_PRELOAD) {
+					if ( (fFirstSegment == NULL) && (segCmd->filesize() != 0) )
+						fBaseAddress = segCmd->vmaddr();
+				} else {
+					if ( (segCmd->fileoff() == 0) && (segCmd->filesize() != 0) )
+						fBaseAddress = segCmd->vmaddr();
+				}
 				if ( fFirstSegment == NULL )
 					fFirstSegment = segCmd;
 				if ( (segCmd->initprot() & VM_PROT_WRITE) != 0 ) {
@@ -608,6 +623,8 @@ const char* DyldInfoPrinter<A>::ordinalName(int libraryOrdinal)
 			return "main-executable";
 		case BIND_SPECIAL_DYLIB_FLAT_LOOKUP:
 			return "flat-namespace";
+		case BIND_SPECIAL_DYLIB_WEAK_LOOKUP:
+			return "weak";
 	}
 	if ( libraryOrdinal < BIND_SPECIAL_DYLIB_FLAT_LOOKUP )
 		throw "unknown special ordinal";
@@ -637,12 +654,164 @@ const char* DyldInfoPrinter<A>::classicOrdinalName(int libraryOrdinal)
 template <typename A>
 void DyldInfoPrinter<A>::printRebaseInfo()
 {
+	bool seenThreadedRebase = false;
 	if ( (fInfo == NULL) || (fInfo->rebase_off() == 0) ) {
-		printf("no compressed rebase info\n");
+		// If we have no rebase opcodes, then we may be using the threaded rebase/bind combined
+		// format and need to parse the bind opcodes instead.
+		if ( (fInfo->rebase_size() == 0) && (fInfo->bind_size() != 0) ) {
+			const uint8_t* p = (uint8_t*)fHeader + fInfo->bind_off();
+			const uint8_t* end = &p[fInfo->bind_size()];
+
+			uint8_t type = 0;
+			uint8_t flags = 0;
+			uint8_t segIndex = 0;
+			uint64_t segOffset = 0;
+			const char* symbolName = NULL;
+			const char* fromDylib = "??";
+			int libraryOrdinal = 0;
+			int64_t addend = 0;
+			uint32_t count;
+			uint32_t skip;
+			pint_t segStartAddr = 0;
+			const char* segName = "??";
+			const char* typeName = "??";
+			const char* weak_import = "";
+			bool done = false;
+			while ( !done && (p < end) ) {
+				uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
+				uint8_t opcode = *p & BIND_OPCODE_MASK;
+				++p;
+				switch (opcode) {
+					case BIND_OPCODE_DONE:
+						done = true;
+						break;
+					case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
+						libraryOrdinal = immediate;
+						fromDylib = ordinalName(libraryOrdinal);
+						break;
+					case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
+						libraryOrdinal = read_uleb128(p, end);
+						fromDylib = ordinalName(libraryOrdinal);
+						break;
+					case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
+						// the special ordinals are negative numbers
+						if ( immediate == 0 )
+							libraryOrdinal = 0;
+						else {
+							int8_t signExtended = BIND_OPCODE_MASK | immediate;
+							libraryOrdinal = signExtended;
+						}
+						fromDylib = ordinalName(libraryOrdinal);
+						break;
+					case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+						symbolName = (char*)p;
+						while (*p != '\0')
+							++p;
+						++p;
+						flags = immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT;
+						if ( flags != 0 )
+							weak_import = " (weak import)";
+						else
+							weak_import = "";
+						break;
+					case BIND_OPCODE_SET_TYPE_IMM:
+						type = immediate;
+						typeName = bindTypeName(type);
+						break;
+					case BIND_OPCODE_SET_ADDEND_SLEB:
+						addend = read_sleb128(p, end);
+						break;
+					case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+						segIndex = immediate;
+						segStartAddr = segStartAddress(segIndex);
+						segName = segmentName(segIndex);
+						segOffset = read_uleb128(p, end);
+						break;
+					case BIND_OPCODE_ADD_ADDR_ULEB:
+						segOffset += read_uleb128(p, end);
+						break;
+					case BIND_OPCODE_DO_BIND:
+						break;
+					case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
+						segOffset += read_uleb128(p, end) + sizeof(pint_t);
+						break;
+					case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
+						segOffset += immediate*sizeof(pint_t) + sizeof(pint_t);
+						break;
+					case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB:
+						count = read_uleb128(p, end);
+						skip = read_uleb128(p, end);
+						for (uint32_t i=0; i < count; ++i) {
+							segOffset += skip + sizeof(pint_t);
+						}
+						break;
+					case BIND_OPCODE_THREADED:
+						// Note the immediate is a sub opcode
+						switch (immediate) {
+							case BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB:
+								printf("rebase information (from compressed dyld info):\n");
+								printf("segment section          address     type         value\n");
+								count = read_uleb128(p, end);
+								seenThreadedRebase = true;
+								break;
+							case BIND_SUBOPCODE_THREADED_APPLY: {
+								uint64_t delta = 0;
+								do {
+									const uint8_t* pointerLocation = (uint8_t*)fHeader + fSegments[segIndex]->fileoff() + segOffset;
+									uint64_t value = P::getP(*(uint64_t*)pointerLocation);
+#if SUPPORT_ARCH_arm64e
+									uint16_t diversity = (uint16_t)(value >> 32);
+									bool hasAddressDiversity = (value & (1ULL << 48)) != 0;
+									uint8_t key = (uint8_t)((value >> 49) & 0x3);
+									bool isAuthenticated = (value & (1ULL << 63)) != 0;
+#endif
+									bool isRebase = (value & (1ULL << 62)) == 0;
+									if (isRebase) {
+
+#if SUPPORT_ARCH_arm64e
+										static const char* keyNames[] = {
+											"IA", "IB", "DA", "DB"
+										};
+										if (isAuthenticated) {
+											uint64_t targetValue = value & 0xFFFFFFFFULL;
+											targetValue += fBaseAddress;
+											printf("%-7s %-16s 0x%08llX  %s  0x%08llX (JOP: diversity %d, address %s, %s)\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, targetValue, diversity, hasAddressDiversity ? "true" : "false", keyNames[key]);
+										} else
+#endif
+										{
+											// Regular pointer which needs to fit in 51-bits of value.
+											// C++ RTTI uses the top bit, so we'll allow the whole top-byte
+											// and the signed-extended bottom 43-bits to be fit in to 51-bits.
+											uint64_t top8Bits = value & 0x0007F80000000000ULL;
+											uint64_t bottom43Bits = value & 0x000007FFFFFFFFFFULL;
+											uint64_t targetValue = ( top8Bits << 13 ) | (((intptr_t)(bottom43Bits << 21) >> 21) & 0x00FFFFFFFFFFFFFF);
+											printf("%-7s %-16s 0x%08llX  %s  0x%08llX\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, targetValue);
+										}
+									}
+									// The delta is bits [51..61]
+									// And bit 62 is to tell us if we are a rebase (0) or bind (1)
+									value &= ~(1ULL << 62);
+									delta = ( value & 0x3FF8000000000000 ) >> 51;
+									segOffset += delta * sizeof(pint_t);
+								} while ( delta != 0);
+								break;
+							}
+							default:
+								throwf("unknown threaded bind subopcode %d", immediate);
+						}
+						break;
+					default:
+						throwf("bad bind opcode %d", *p);
+				}
+			}
+		}
+
+		if (!seenThreadedRebase)
+			printf("no compressed rebase info\n");
 	}
 	else {
 		printf("rebase information (from compressed dyld info):\n");
-		printf("segment section          address     type\n");
+		printf("segment section          address     type         value\n");
 
 		const uint8_t* p = (uint8_t*)fHeader + fInfo->rebase_off();
 		const uint8_t* end = &p[fInfo->rebase_size()];
@@ -655,6 +824,8 @@ void DyldInfoPrinter<A>::printRebaseInfo()
 		pint_t segStartAddr = 0;
 		const char* segName = "??";
 		const char* typeName = "??";
+		const uint8_t* pointerLocation = nullptr;
+		uint64_t value = 0;
 		bool done = false;
 		while ( !done && (p < end) ) {
 			uint8_t immediate = *p & REBASE_IMMEDIATE_MASK;
@@ -682,35 +853,42 @@ void DyldInfoPrinter<A>::printRebaseInfo()
 					break;
 				case REBASE_OPCODE_DO_REBASE_IMM_TIMES:
 					for (int i=0; i < immediate; ++i) {
-						printf("%-7s %-16s 0x%08llX  %s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName);
+						pointerLocation = (uint8_t*)fHeader + fSegments[segIndex]->fileoff() + segOffset;
+						value = P::getP(*(uint64_t*)pointerLocation);
+						printf("%-7s %-16s 0x%08llX  %s  0x%08llX\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, value);
 						segOffset += sizeof(pint_t);
 					}
 					break;
 				case REBASE_OPCODE_DO_REBASE_ULEB_TIMES:
 					count = read_uleb128(p, end);
 					for (uint32_t i=0; i < count; ++i) {
-						printf("%-7s %-16s 0x%08llX  %s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName);
+						pointerLocation = (uint8_t*)fHeader + fSegments[segIndex]->fileoff() + segOffset;
+						value = P::getP(*(uint64_t*)pointerLocation);
+						printf("%-7s %-16s 0x%08llX  %s  0x%08llX\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, value);
 						segOffset += sizeof(pint_t);
 					}
 					break;
 				case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB:
-					printf("%-7s %-16s 0x%08llX  %s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName);
+					pointerLocation = (uint8_t*)fHeader + fSegments[segIndex]->fileoff() + segOffset;
+					value = P::getP(*(uint64_t*)pointerLocation);
+					printf("%-7s %-16s 0x%08llX  %s  0x%08llX\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, value);
 					segOffset += read_uleb128(p, end) + sizeof(pint_t);
 					break;
 				case REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB:
 					count = read_uleb128(p, end);
 					skip = read_uleb128(p, end);
 					for (uint32_t i=0; i < count; ++i) {
-						printf("%-7s %-16s 0x%08llX  %s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName);
+						pointerLocation = (uint8_t*)fHeader + fSegments[segIndex]->fileoff() + segOffset;
+						value = P::getP(*(uint64_t*)pointerLocation);
+						printf("%-7s %-16s 0x%08llX  %s  0x%08llX\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, value);
 						segOffset += skip + sizeof(pint_t);
 					}
 					break;
 				default:
 					throwf("bad rebase opcode %d", *p);
 			}
-		}	
+		}
 	}
-
 }
 
 
@@ -783,11 +961,6 @@ void DyldInfoPrinter<A>::printRebaseInfoOpcodes()
 	}
 
 }
-
-
-
-
-
 
 template <typename A>
 void DyldInfoPrinter<A>::printBindingInfoOpcodes(bool weakbinding)
@@ -894,6 +1067,20 @@ void DyldInfoPrinter<A>::printBindingInfoOpcodes(bool weakbinding)
 					skip = read_uleb128(p, end);
 					printf("0x%04X BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB(%d, 0x%08X)\n", opcodeOffset, count, skip);
 					break;
+				case BIND_OPCODE_THREADED:
+					// Note the immediate is a sub opcode
+					switch (immediate) {
+						case BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB:
+							count = read_uleb128(p, end);
+							printf("0x%04X BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB(%d)\n", opcodeOffset, count);
+							break;
+						case BIND_SUBOPCODE_THREADED_APPLY:
+							printf("0x%04X BIND_SUBOPCODE_THREADED_APPLY\n", opcodeOffset);
+							break;
+						default:
+							throwf("unknown threaded bind subopcode %d", immediate);
+					}
+					break;
 				default:
 					throwf("unknown bind opcode %d", *p);
 			}
@@ -902,7 +1089,20 @@ void DyldInfoPrinter<A>::printBindingInfoOpcodes(bool weakbinding)
 
 }
 
+struct ThreadedBindData {
+	ThreadedBindData(const char* symbolName, int64_t addend, int libraryOrdinal, uint8_t flags, uint8_t type)
+		: symbolName(symbolName), addend(addend), libraryOrdinal(libraryOrdinal), flags(flags), type(type) { }
 
+	std::tuple<const char*, int64_t, int, uint8_t, uint8_t> pack() const {
+		return std::make_tuple(symbolName, addend, libraryOrdinal, flags, type);
+	}
+
+	const char* symbolName 	= nullptr;
+	int64_t addend 			= 0;
+	int libraryOrdinal 		= 0;
+	uint8_t flags			= 0;
+	uint8_t type			= 0;
+};
 
 template <typename A>
 void DyldInfoPrinter<A>::printBindingInfo()
@@ -915,8 +1115,9 @@ void DyldInfoPrinter<A>::printBindingInfo()
 		printf("segment section          address        type    addend dylib            symbol\n");
 		const uint8_t* p = (uint8_t*)fHeader + fInfo->bind_off();
 		const uint8_t* end = &p[fInfo->bind_size()];
-		
+
 		uint8_t type = 0;
+		uint8_t flags = 0;
 		uint8_t segIndex = 0;
 		uint64_t segOffset = 0;
 		const char* symbolName = NULL;
@@ -929,6 +1130,8 @@ void DyldInfoPrinter<A>::printBindingInfo()
 		const char* segName = "??";
 		const char* typeName = "??";
 		const char* weak_import = "";
+		std::vector<ThreadedBindData> ordinalTable;
+		bool useThreadedRebaseBind = false;
 		bool done = false;
 		while ( !done && (p < end) ) {
 			uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
@@ -961,7 +1164,8 @@ void DyldInfoPrinter<A>::printBindingInfo()
 					while (*p != '\0')
 						++p;
 					++p;
-					if ( (immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0 )
+					flags = immediate & BIND_SYMBOL_FLAGS_WEAK_IMPORT;
+					if ( flags != 0 )
 						weak_import = " (weak import)";
 					else
 						weak_import = "";
@@ -983,8 +1187,12 @@ void DyldInfoPrinter<A>::printBindingInfo()
 					segOffset += read_uleb128(p, end);
 					break;
 				case BIND_OPCODE_DO_BIND:
-					printf("%-7s %-16s 0x%08llX %10s  %5lld %-16s %s%s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, addend, fromDylib, symbolName, weak_import );
-					segOffset += sizeof(pint_t);
+					if (!useThreadedRebaseBind) {
+						printf("%-7s %-16s 0x%08llX %10s  %5lld %-16s %s%s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, addend, fromDylib, symbolName, weak_import );
+						segOffset += sizeof(pint_t);
+					} else {
+						ordinalTable.push_back(ThreadedBindData(symbolName, addend, libraryOrdinal, flags, type));
+					}
 					break;
 				case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
 					printf("%-7s %-16s 0x%08llX %10s  %5lld %-16s %s%s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, addend, fromDylib, symbolName, weak_import );
@@ -1000,6 +1208,68 @@ void DyldInfoPrinter<A>::printBindingInfo()
 					for (uint32_t i=0; i < count; ++i) {
 						printf("%-7s %-16s 0x%08llX %10s  %5lld %-16s %s%s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, addend, fromDylib, symbolName, weak_import );
 						segOffset += skip + sizeof(pint_t);
+					}
+					break;
+				case BIND_OPCODE_THREADED:
+					// Note the immediate is a sub opcode
+					switch (immediate) {
+						case BIND_SUBOPCODE_THREADED_SET_BIND_ORDINAL_TABLE_SIZE_ULEB:
+							count = read_uleb128(p, end);
+							ordinalTable.clear();
+							ordinalTable.reserve(count);
+							useThreadedRebaseBind = true;
+							break;
+						case BIND_SUBOPCODE_THREADED_APPLY: {
+							uint64_t delta = 0;
+							do {
+								const uint8_t* pointerLocation = (uint8_t*)fHeader + fSegments[segIndex]->fileoff() + segOffset;
+								uint64_t value = P::getP(*(uint64_t*)pointerLocation);
+#if SUPPORT_ARCH_arm64e
+								uint16_t diversity = (uint16_t)(value >> 32);
+								bool hasAddressDiversity = (value & (1ULL << 48)) != 0;
+								uint8_t key = (uint8_t)((value >> 49) & 0x3);
+								bool isAuthenticated = (value & (1ULL << 63)) != 0;
+#endif
+								bool isRebase = (value & (1ULL << 62)) == 0;
+
+								if (isRebase) {
+									//printf("(rebase): %-7s %-16s 0x%08llX  %s\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName);
+								} else {
+									// the ordinal is bits [0..15]
+									uint16_t ordinal = value & 0xFFFF;
+									if (ordinal >= ordinalTable.size()) {
+										fprintf(stderr, "bind ordinal is out of range\n");
+										break;
+									}
+									std::tie(symbolName, addend, libraryOrdinal, flags, type) = ordinalTable[ordinal].pack();
+									if ( (flags & BIND_SYMBOL_FLAGS_WEAK_IMPORT) != 0 )
+										weak_import = " (weak import)";
+									else
+										weak_import = "";
+									fromDylib = ordinalName(libraryOrdinal);
+#if SUPPORT_ARCH_arm64e
+									if (isAuthenticated) {
+										static const char* keyNames[] = {
+											"IA", "IB", "DA", "DB"
+										};
+										printf("%-7s %-16s 0x%08llX %10s  %5lld %-16s %s%s with value 0x%016llX (JOP: diversity %d, address %s, %s)\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, addend, fromDylib, symbolName, weak_import, value, diversity, hasAddressDiversity ? "true" : "false", keyNames[key]);
+									} else
+#endif
+									{
+										printf("%-7s %-16s 0x%08llX %10s  %5lld %-16s %s%s with value 0x%016llX\n", segName, sectionName(segIndex, segStartAddr+segOffset), segStartAddr+segOffset, typeName, addend, fromDylib, symbolName, weak_import, value );
+									}
+								}
+
+								// The delta is bits [51..61]
+								// And bit 62 is to tell us if we are a rebase (0) or bind (1)
+								value &= ~(1ULL << 62);
+								delta = ( value & 0x3FF8000000000000 ) >> 51;
+								segOffset += delta * sizeof(pint_t);
+							} while ( delta != 0);
+							break;
+						}
+						default:
+							throwf("unknown threaded bind subopcode %d", immediate);
 					}
 					break;
 				default:
@@ -1652,7 +1922,10 @@ void DyldInfoPrinter<A>::printSharedRegionInfo()
 				uint64_t toOffsetCount = read_uleb128(p, infoEnd);
 				const macho_section<P>* fromSection = fSections[fromSectionIndex];
 				const macho_section<P>* toSection = fSections[toSectionIndex];
-				printf("from sect=%s, to sect=%s, count=%lld:\n", fromSection->sectname(), toSection->sectname(), toOffsetCount);
+				char fromSectionName[20];
+				strncpy(fromSectionName, fromSection->sectname(), 16);
+				fromSectionName[16] = '\0';
+				printf("from sect=%s/%s, to sect=%s/%s, count=%lld:\n", fromSection->segname(), fromSectionName, toSection->segname(), toSection->sectname(), toOffsetCount);
 				uint64_t toSectionOffset = 0;
 				const char* lastFromSymbol = NULL;
 				for (uint64_t j=0; j < toOffsetCount; ++j) {
@@ -1724,6 +1997,8 @@ const char* DyldInfoPrinter<A>::sharedRegionKindName(uint8_t kind)
 			return "br22";
 		case DYLD_CACHE_ADJ_V2_IMAGE_OFF_32:
 			return "off32";
+		case DYLD_CACHE_ADJ_V2_THREADED_POINTER_64:
+			return "theaded-pointer64";
 	}
 }
 
@@ -1882,56 +2157,40 @@ void DyldInfoPrinter<A>::printDataInCode()
 
 
 template <>
-ppc::P::uint_t DyldInfoPrinter<ppc>::relocBase()
+x86_64::P::uint_t DyldInfoPrinter<x86_64>::localRelocBase()
 {
-	if ( fHeader->flags() & MH_SPLIT_SEGS )
-		return fFirstWritableSegment->vmaddr();
-	else
+	if (fHeader->filetype() == MH_KEXT_BUNDLE) {
+		// for kext bundles the reloc base address starts at __TEXT segment
 		return fFirstSegment->vmaddr();
-}
-
-template <>
-ppc64::P::uint_t DyldInfoPrinter<ppc64>::relocBase()
-{
-	if ( fWriteableSegmentWithAddrOver4G ) 
-		return fFirstWritableSegment->vmaddr();
-	else
-		return fFirstSegment->vmaddr();
-}
-
-template <>
-x86::P::uint_t DyldInfoPrinter<x86>::relocBase()
-{
-	if ( fHeader->flags() & MH_SPLIT_SEGS )
-		return fFirstWritableSegment->vmaddr();
-	else
-		return fFirstSegment->vmaddr();
-}
-
-template <>
-x86_64::P::uint_t DyldInfoPrinter<x86_64>::relocBase()
-{
+	}
+	// for all other kinds, the x86_64 reloc base address starts at first writable segment (usually __DATA)
 	return fFirstWritableSegment->vmaddr();
 }
 
-#if SUPPORT_ARCH_arm_any
-template <>
-arm::P::uint_t DyldInfoPrinter<arm>::relocBase()
+template <typename A>
+typename A::P::uint_t DyldInfoPrinter<A>::localRelocBase()
 {
-	if ( fHeader->flags() & MH_SPLIT_SEGS )
-		return fFirstWritableSegment->vmaddr();
-	else
-		return fFirstSegment->vmaddr();
+	return fFirstSegment->vmaddr();
 }
-#endif
 
-#if SUPPORT_ARCH_arm64
+
 template <>
-arm64::P::uint_t DyldInfoPrinter<arm64>::relocBase()
+x86_64::P::uint_t DyldInfoPrinter<x86_64>::externalRelocBase()
 {
+	if (fHeader->filetype() == MH_KEXT_BUNDLE) {
+		// for kext bundles the reloc base address starts at __TEXT segment
+		return fFirstSegment->vmaddr();;
+	}
 	return fFirstWritableSegment->vmaddr();
 }
-#endif
+
+template <typename A>
+typename A::P::uint_t DyldInfoPrinter<A>::externalRelocBase()
+{
+	return 0;
+}
+
+
 
 template <>
 const char*	DyldInfoPrinter<ppc>::relocTypeName(uint8_t r_type)
@@ -1967,6 +2226,8 @@ const char*	DyldInfoPrinter<x86_64>::relocTypeName(uint8_t r_type)
 {
 	if ( r_type == X86_64_RELOC_UNSIGNED )
 		return "pointer";
+	else if ( r_type == X86_64_RELOC_BRANCH )
+		return "branch";
 	else
 		return "??";
 }
@@ -1994,17 +2255,105 @@ const char*	DyldInfoPrinter<arm64>::relocTypeName(uint8_t r_type)
 }
 #endif
 
+
 template <typename A>
 void DyldInfoPrinter<A>::printRelocRebaseInfo()
 {
+	// First check if we can find a magic section for threaded rebase
+	{
+		auto rebaseChain = [this](uintptr_t chainStartMappedAddress, uintptr_t chainStartVMAddress, uint64_t stepMultiplier, uintptr_t baseAddress) {
+			uint64_t delta = 0;
+			uintptr_t mappedAddress = chainStartMappedAddress;
+			uintptr_t vmAddress = chainStartVMAddress;
+			do {
+				uint64_t value = *(uint64_t*)mappedAddress;
+
+				uint8_t segIndex = segmentIndexForAddress(vmAddress);
+				const char* segName = segmentName(segIndex);
+				const char* sectName = sectionName(segIndex, vmAddress);
+
+#if SUPPORT_ARCH_arm64e
+				uint16_t diversity = (uint16_t)(value >> 32);
+				bool hasAddressDiversity = (value & (1ULL << 48)) != 0;
+				uint8_t key = (uint8_t)((value >> 49) & 0x3);
+				bool isAuthenticated = (value & (1ULL << 63)) != 0;
+#endif
+				bool isRebase = (value & (1ULL << 62)) == 0;
+				if (isRebase) {
+
+#if SUPPORT_ARCH_arm64e
+					if (isAuthenticated) {
+						uint64_t slide = 0;
+						static const char* keyNames[] = {
+							"IA", "IB", "DA", "DB"
+						};
+						// The new value for a rebase is the low 32-bits of the threaded value plus the slide.
+						uint64_t newValue = (value & 0xFFFFFFFF) + slide;
+						// Add in the offset from the mach_header
+						newValue += baseAddress;
+						// We have bits to merge in to the discriminator
+						printf("%-7s %-16s 0x%08llX  %s  0x%08llX with value 0x%016llX (JOP: diversity %d, address %s, %s)\n",
+							   segName, sectName, (uint64_t)vmAddress, "pointer", newValue, value,
+							   diversity, hasAddressDiversity ? "true" : "false", keyNames[key]);
+					} else
+#endif
+					{
+						// Regular pointer which needs to fit in 51-bits of value.
+						// C++ RTTI uses the top bit, so we'll allow the whole top-byte
+						// and the bottom 43-bits to be fit in to 51-bits.
+						uint64_t top8Bits = value & 0x0007F80000000000ULL;
+						uint64_t bottom43Bits = value & 0x000007FFFFFFFFFFULL;
+						uint64_t targetValue = ( top8Bits << 13 ) | (((intptr_t)(bottom43Bits << 21) >> 21) & 0x00FFFFFFFFFFFFFF);
+						printf("%-7s %-16s 0x%08llX  %s  0x%08llX with value 0x%016llX\n", segName, sectName, (uint64_t)vmAddress, "pointer", targetValue, value);
+					}
+				}
+
+				// The delta is bits [51..61]
+				// And bit 62 is to tell us if we are a rebase (0) or bind (1)
+				value &= ~(1ULL << 62);
+				delta = ( value & 0x3FF8000000000000 ) >> 51;
+				mappedAddress += delta * stepMultiplier;
+				vmAddress += delta * stepMultiplier;
+			} while ( delta != 0 );
+		};
+		for(const macho_segment_command<P>* segCmd : fSegments) {
+			if (strcmp(segCmd->segname(), "__TEXT") != 0)
+				continue;
+			macho_section<P>* const sectionsStart = (macho_section<P>*)((char*)segCmd + sizeof(macho_segment_command<P>));
+			macho_section<P>* const sectionsEnd = &sectionsStart[segCmd->nsects()];
+			for(macho_section<P>* sect = sectionsStart; sect < sectionsEnd; ++sect) {
+				if (strcmp(sect->sectname(), "__thread_starts") != 0)
+					continue;
+				printf("rebase information (from __TEXT,__thread_starts):\n");
+				printf("segment  section          address     type\n");
+				const uint8_t* sectionContent = (uint8_t*)fHeader + sect->offset();
+				uint32_t *threadStarts = (uint32_t*)sectionContent;
+				uint32_t *threadEnds = (uint32_t*)(sectionContent + sect->size());
+				uint32_t threadStartsHeader = threadStarts[0];
+				uint64_t stepMultiplier = (threadStartsHeader & 1) == 1 ? 8 : 4;
+				for (uint32_t* threadOffset = threadStarts + 1; threadOffset != threadEnds; ++threadOffset) {
+					//printf("Thread start offset: 0x%016X\n", *threadOffset);
+					// If we get a 0xFFFFFFFF offset then ld64 overestimated the size required.  So skip the remainder
+					// of the entries.
+					if (*threadOffset == 0xFFFFFFFF)
+						break;
+					uint64_t chainStartVMAddr = fBaseAddress + *threadOffset;
+					uintptr_t chainStartMappedAddress = (uintptr_t)mappedAddressForVMAddress(chainStartVMAddr);
+					rebaseChain(chainStartMappedAddress, chainStartVMAddr, stepMultiplier, fBaseAddress);
+				}
+				return;
+			}
+		}
+	}
+
 	if ( fDynamicSymbolTable == NULL ) {
 		printf("no classic dynamic symbol table");
 	}
 	else {
 		printf("rebase information (from local relocation records and indirect symbol table):\n");
-		printf("segment  section          address     type\n");
+		printf("segment      section          address     type\n");
 		// walk all local relocations
-		pint_t rbase = relocBase();
+		pint_t rbase = localRelocBase();
 		const macho_relocation_info<P>* const relocsStart = (macho_relocation_info<P>*)(((uint8_t*)fHeader) + fDynamicSymbolTable->locreloff());
 		const macho_relocation_info<P>* const relocsEnd = &relocsStart[fDynamicSymbolTable->nlocrel()];
 		for (const macho_relocation_info<P>* reloc=relocsStart; reloc < relocsEnd; ++reloc) {
@@ -2014,7 +2363,7 @@ void DyldInfoPrinter<A>::printRelocRebaseInfo()
 				const char* typeName = relocTypeName(reloc->r_type());
 				const char* segName  = segmentName(segIndex);
 				const char* sectName = sectionName(segIndex, addr);
-				printf("%-8s %-16s 0x%08llX  %s\n", segName, sectName, (uint64_t)addr, typeName);
+				printf("%-12s %-16s 0x%08llX  %s\n", segName, sectName, (uint64_t)addr, typeName);
 			} 
 			else {
 				const macho_scattered_relocation_info<P>* sreloc = (macho_scattered_relocation_info<P>*)reloc;
@@ -2023,7 +2372,7 @@ void DyldInfoPrinter<A>::printRelocRebaseInfo()
 				const char* typeName = relocTypeName(sreloc->r_type());
 				const char* segName  = segmentName(segIndex);
 				const char* sectName = sectionName(segIndex, addr);
-				printf("%-8s %-16s 0x%08llX  %s\n", segName, sectName, (uint64_t)addr, typeName);
+				printf("%-12s %-16s 0x%08llX  %s\n", segName, sectName, (uint64_t)addr, typeName);
 			}
 		}
 		// look for local non-lazy-pointers
@@ -2045,7 +2394,7 @@ void DyldInfoPrinter<A>::printRelocRebaseInfo()
 							const char* typeName = "pointer";
 							const char* segName  = segmentName(segIndex);
 							const char* sectName = sectionName(segIndex, addr);
-							printf("%-8s %-16s 0x%08llX  %s\n", segName, sectName, (uint64_t)addr, typeName);
+							printf("%-12s %-16s 0x%08llX  %s\n", segName, sectName, (uint64_t)addr, typeName);
 						}
 					}
 				}
@@ -2143,10 +2492,10 @@ void DyldInfoPrinter<A>::printClassicBindingInfo()
 		printf("no classic dynamic symbol table");
 	}
 	else {
-		printf("binding information (from relocations and indirect symbol table):\n");
-		printf("segment  section          address        type   weak  addend dylib            symbol\n");
+		printf("binding information (from external relocations and indirect symbol table):\n");
+		printf("segment      section          address        type   weak  addend dylib            symbol\n");
 		// walk all external relocations
-		pint_t rbase = relocBase();
+		pint_t rbase = externalRelocBase();
 		const macho_relocation_info<P>* const relocsStart = (macho_relocation_info<P>*)(((uint8_t*)fHeader) + fDynamicSymbolTable->extreloff());
 		const macho_relocation_info<P>* const relocsEnd = &relocsStart[fDynamicSymbolTable->nextrel()];
 		for (const macho_relocation_info<P>* reloc=relocsStart; reloc < relocsEnd; ++reloc) {
@@ -2161,13 +2510,15 @@ void DyldInfoPrinter<A>::printClassicBindingInfo()
 			const char* segName  = segmentName(segIndex);
 			const char* sectName = sectionName(segIndex, addr);
 			const pint_t* addressMapped = mappedAddressForVMAddress(addr);
-			int64_t addend = P::getP(*addressMapped); 
+			int64_t addend = P::getP(*addressMapped);
+			if ( strcmp(typeName, "pointer") != 0 )
+				addend = 0;
 			if ( fHeader->flags() & MH_PREBOUND ) {
 				// In prebound binaries the content is already pointing to the target.
 				// To get the addend requires subtracting out the base address it was prebound to.
 				addend -= sym->n_value();
 			}
-			printf("%-8s %-16s 0x%08llX %10s %4s  %5lld %-16s %s\n", segName, sectName, (uint64_t)addr, 
+			printf("%-12s %-16s 0x%08llX %10s %4s  %5lld %-16s %s\n", segName, sectName, (uint64_t)addr,
 									typeName, weak_import, addend, fromDylib, symbolName);
 		}
 		// look for non-lazy pointers
@@ -2194,7 +2545,7 @@ void DyldInfoPrinter<A>::printClassicBindingInfo()
 							const char* segName  = segmentName(segIndex);
 							const char* sectName = sectionName(segIndex, addr);
 							int64_t addend = 0;
-							printf("%-8s %-16s 0x%08llX %10s %4s  %5lld %-16s %s\n", segName, sectName, (uint64_t)addr, 
+							printf("%-12s %-16s 0x%08llX %10s %4s  %5lld %-16s %s\n", segName, sectName, (uint64_t)addr,
 																	typeName, weak_import, addend, fromDylib, symbolName);
 						}
 					}
@@ -2324,7 +2675,7 @@ static void dump(const char* path)
 						if ( DyldInfoPrinter<arm64>::validFile(p + offset) )
 							DyldInfoPrinter<arm64>::make(p + offset, size, path, (sPreferredArch == 0));
 						else
-							throw "in universal file, arm64 slice does not contain arm mach-o";
+							throw "in universal file, arm64 slice does not contain arm64 mach-o";
 						break;
 #endif
 					default:
@@ -2400,14 +2751,6 @@ int main(int argc, const char* argv[])
 						sPreferredArch = CPU_TYPE_POWERPC64;
 					else if ( strcmp(arch, "ppc") == 0 )
 						sPreferredArch = CPU_TYPE_POWERPC;
-					else if ( strcmp(arch, "i386") == 0 )
-						sPreferredArch = CPU_TYPE_I386;
-					else if ( strcmp(arch, "x86_64") == 0 )
-						sPreferredArch = CPU_TYPE_X86_64;
-#if SUPPORT_ARCH_arm64
-					else if ( strcmp(arch, "arm64") == 0 )
-						sPreferredArch = CPU_TYPE_ARM64;
-#endif
 					else {
 						if ( arch == NULL )
 							throw "-arch missing architecture name";

@@ -104,6 +104,11 @@ __private_extern__ void swap_fat_arch(
     uint32_t nfat_arch,
     enum byte_sex target_byte_sex);
 
+__private_extern__ void swap_fat_arch_64(
+    struct fat_arch_64 *fat_archs64,
+    uint32_t nfat_arch,
+    enum byte_sex target_byte_sex);
+
 __private_extern__ void swap_mach_header(
     struct mach_header *mh,
     enum byte_sex target_byte_sex);
@@ -318,6 +323,10 @@ __private_extern__ void swap_arm_thread_state64_t(
     arm_thread_state64_t *cpu,
     enum byte_sex target_byte_sex);
 
+__private_extern__ void swap_arm_exception_state64_t(
+    arm_exception_state64_t *except,
+    enum byte_sex target_byte_sex);
+
 __private_extern__ void swap_ident_command(
     struct ident_command *id_cmd,
     enum byte_sex target_byte_sex);
@@ -378,6 +387,19 @@ __private_extern__ void swap_source_version_command(
     struct source_version_command *sv,
     enum byte_sex target_byte_sex);
 
+__private_extern__ void swap_note_command(
+    struct note_command *nc,
+    enum byte_sex target_byte_sex);
+
+__private_extern__ void swap_build_version_command(
+    struct build_version_command *bv,
+    enum byte_sex target_byte_sex);
+
+__private_extern__ void swap_build_tool_version(
+    struct build_tool_version *bt,
+    uint32_t ntools,
+    enum byte_sex target_byte_sex);
+
 __private_extern__ void swap_nlist(
     struct nlist *symbols,
     uint32_t nsymbols,
@@ -391,6 +413,11 @@ __private_extern__ void swap_nlist_64(
 __private_extern__ void swap_ranlib(
     struct ranlib *ranlibs,
     uint32_t nranlibs,
+    enum byte_sex target_byte_sex);
+
+__private_extern__ void swap_ranlib_64(
+    struct ranlib_64 *ranlibs,
+    uint64_t nranlibs,
     enum byte_sex target_byte_sex);
 
 __private_extern__ void swap_relocation_info(
@@ -455,6 +482,6 @@ __private_extern__ enum bool swap_object_headers(
  */
 __private_extern__ enum byte_sex get_toc_byte_sex(
     char *addr,
-    uint32_t size);
+    uint64_t size);
 
 #endif /* _STUFF_BYTESEX_H_ */

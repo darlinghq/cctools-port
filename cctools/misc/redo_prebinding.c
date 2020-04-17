@@ -86,6 +86,7 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <strings.h> /* cctools-port: For bcmp, bzero ... */
 #import <limits.h>
 #import <libc.h>
 #import <malloc/malloc.h>
@@ -106,7 +107,7 @@
 #import <stuff/hppa.h>
 #import <stuff/execute.h>
 #import <stuff/guess_short_name.h>
-#import <stuff/seg_addr_table.h>
+#import <stuff/seg_addr_table.h> /* cctools-port: uncommented */
 #import <stuff/macosx_deployment_target.h>
 
 #include <mach-o/dyld.h>
@@ -918,7 +919,7 @@ char *envp[])
                 if(write_to_stdout)
                     output_file = NULL;
 		writeout(archs, narchs, output_file, mode, TRUE, FALSE, FALSE,
-			 NULL);
+		         FALSE, NULL);
 		if(errors){
                     if(write_to_stdout == FALSE)
                         unlink(output_file);
@@ -928,7 +929,7 @@ char *envp[])
 	    else{
 		output_file = makestr(input_file, ".redo_prebinding", NULL);
 		writeout(archs, narchs, output_file, mode, TRUE, FALSE, FALSE,
-			 NULL);
+			 FALSE, NULL);
 		if(errors){
 		    unlink(output_file);
 		    return(2);
@@ -1608,8 +1609,8 @@ uint32_t *throttle)
             gid = stat_buf.st_gid;
 
 	    if(output_file != NULL){
-		writeout(archs, narchs, (char *)output_file, mode, TRUE, FALSE, 
-			 FALSE, throttle);
+		writeout(archs, narchs, (char *)output_file, mode, TRUE, FALSE,
+			 FALSE, FALSE, throttle);
 		if(errors){
 		    unlink(output_file);
 		    goto error_return;
@@ -1617,8 +1618,8 @@ uint32_t *throttle)
 	    }
 	    else{
 		output_file = makestr(file_name, ".redo_prebinding", NULL);
-		writeout(archs, narchs, (char *)output_file, mode, TRUE, FALSE, 
-			 FALSE, throttle);
+		writeout(archs, narchs, (char *)output_file, mode, TRUE, FALSE,
+			 FALSE, FALSE, throttle);
 		if(errors){
 		    unlink(output_file);
 		    goto error_return;
@@ -1709,6 +1710,11 @@ error_return:
  * All resulting binaries successfully processed by unprebind() will have
  * the MH_CANONICAL flag.
  */
+/*
+ * Note: unprebind API boundary will not support files larger than 2^32 bytes
+ * in size. If the output size is too large to fit in outlen unprebind will
+ * return REDO_PREBINDING_FAILURE.
+ */
 enum redo_prebinding_retval
 unprebind(
 const char *file_name,
@@ -1729,6 +1735,7 @@ uint32_t *outlen)
     uid_t uid;
     gid_t gid;
     enum bool calculate_input_prebind_cksum, seen_archive;
+    uint64_t outlen64;
 
 	reset_statics();
 	progname = (char *)program_name;
@@ -1824,12 +1831,14 @@ uint32_t *outlen)
 	    }
 
 	    if(output_file != NULL){
-	    	if(outbuf != NULL)
+	    	if(outbuf != NULL){
 		    writeout_to_mem(archs, narchs, (char *)output_file, outbuf,
-	    			    outlen, TRUE, FALSE, FALSE, &seen_archive);
-	    	else
+	    			    &outlen64, TRUE, FALSE, FALSE, FALSE,
+				    &seen_archive);
+		    *outlen = (uint32_t)outlen64;
+	    	}else
 		    writeout(archs, narchs, (char *)output_file, mode, TRUE, 
-			     FALSE, FALSE, NULL);
+			     FALSE, FALSE, FALSE, NULL);
 		if(errors){
 		    if(outbuf == NULL)
 			unlink(output_file);
@@ -1838,12 +1847,20 @@ uint32_t *outlen)
 	    }
 	    else{
 		output_file = makestr(file_name, ".redo_prebinding", NULL);
-		if(outbuf != NULL)
+		if(outbuf != NULL){
 		    writeout_to_mem(archs, narchs, (char *)output_file, outbuf,
-				    outlen, TRUE, FALSE, FALSE, &seen_archive);
-		else
+				    &outlen64, TRUE, FALSE, FALSE, FALSE,
+				    &seen_archive);
+		    /* error if outlen is too large */
+		    if (outlen64 > 0xFFFFFFFF) {
+			if(outbuf == NULL)
+			    unlink(output_file);
+			goto error_return;
+		    }
+		    *outlen = (uint32_t)outlen64;
+		}else
 		    writeout(archs, narchs, (char *)output_file, mode, TRUE, 
-			     FALSE, FALSE, NULL);
+			     FALSE, FALSE, FALSE, NULL);
 		if(errors){
 		    if(outbuf == NULL)
 			unlink(output_file);
@@ -2211,6 +2228,10 @@ char **error_message)
 		    (*cksums)[i].has_cksum = 1;
 		    (*cksums)[i].cksum = arch->object->cs->cksum;
 		}
+	    }
+	    else if(arch->fat_arch64 != NULL){
+		(*cksums)[i].cputype = arch->fat_arch64->cputype;
+		(*cksums)[i].cpusubtype = arch->fat_arch64->cpusubtype;
 	    }
 	    else if(arch->fat_arch != NULL){
 		(*cksums)[i].cputype = arch->fat_arch->cputype;
@@ -2965,13 +2986,15 @@ void)
 			guess_short_name(arch_lib.dylib_name, &is_framework,
 					 &suffix);
 		    if(is_framework == TRUE){
-			arch_lib.name_size = strlen(arch_lib.umbrella_name);
+			arch_lib.name_size =
+			    (uint32_t)strlen(arch_lib.umbrella_name);
 		    }
 		    else{
 			if(arch_lib.umbrella_name != NULL){
 			    arch_lib.library_name = arch_lib.umbrella_name;
 			    arch_lib.umbrella_name = NULL;
-			    arch_lib.name_size = strlen(arch_lib.library_name);
+			    arch_lib.name_size =
+				(uint32_t)strlen(arch_lib.library_name);
 			}
 		    }
 		    if(suffix != NULL)
@@ -3544,6 +3567,7 @@ uint32_t *image_pointer)
     char *dylib_name;
     struct ofile *ofile;
     struct fat_arch *best_fat_arch;
+    struct fat_arch_64 *best_fat_arch64;
     struct load_command *lc;
     struct dylib_command *dl_id;
     enum bool already_loaded, is_framework;
@@ -3640,12 +3664,23 @@ uint32_t *image_pointer)
 	 * the correct architecture.
 	 */
 	if(ofile->file_type == OFILE_FAT){
-	    best_fat_arch = cpusubtype_findbestarch(
-		arch_flag.cputype,
-		arch_flag.cpusubtype,
-		ofile->fat_archs,
-		ofile->fat_header->nfat_arch);
-	    if(best_fat_arch == NULL){
+	    if(ofile->fat_header->magic == FAT_MAGIC_64){
+		best_fat_arch64 = cpusubtype_findbestarch_64(
+		    arch_flag.cputype,
+		    arch_flag.cpusubtype,
+		    ofile->fat_archs64,
+		    ofile->fat_header->nfat_arch);
+		best_fat_arch = NULL;
+	    }
+	    else{
+		best_fat_arch = cpusubtype_findbestarch(
+		    arch_flag.cputype,
+		    arch_flag.cpusubtype,
+		    ofile->fat_archs,
+		    ofile->fat_header->nfat_arch);
+		best_fat_arch64 = NULL;
+	    }
+	    if(best_fat_arch == NULL && best_fat_arch64 == NULL){
 		/*
 		 * If we are allowing missing architectures except one see if
 		 * this is not the one that can't be missing.
@@ -3664,8 +3699,14 @@ uint32_t *image_pointer)
 
 	    (void)ofile_first_arch(ofile);
 	    do{
-		if(best_fat_arch != ofile->fat_archs + ofile->narch)
-		    continue;
+		if(ofile->fat_header->magic == FAT_MAGIC_64){
+		    if(best_fat_arch64 != ofile->fat_archs64 + ofile->narch)
+			continue;
+		}
+		else{
+		    if(best_fat_arch != ofile->fat_archs + ofile->narch)
+			continue;
+		}
 		if(ofile->arch_type == OFILE_ARCHIVE){
 		    error("file: %s (for architecture %s) is an archive (not "
 			  "a Mach-O dynamic shared library)", dylib_name,
@@ -3845,13 +3886,15 @@ good:
 							 &is_framework,
 							 &suffix);
 	    if(is_framework == TRUE){
-		libs[nlibs].name_size = strlen(libs[nlibs].umbrella_name);
+		libs[nlibs].name_size =
+		    (uint32_t)strlen(libs[nlibs].umbrella_name);
 	    }
 	    else{
 		if(libs[nlibs].umbrella_name != NULL){
 		    libs[nlibs].library_name = libs[nlibs].umbrella_name;
 		    libs[nlibs].umbrella_name = NULL;
-		    libs[nlibs].name_size = strlen(libs[nlibs].library_name);
+		    libs[nlibs].name_size =
+			(uint32_t)strlen(libs[nlibs].library_name);
 		}
 	    }
 	    if(suffix != NULL)
@@ -4581,7 +4624,7 @@ char *symbol_name)
 			 (int (*)(const void *,const void *))nlist_bsearch);
 		if(symbol == NULL)
 		    continue;
-		symbol_index = symbol - libs[i].symbols;
+		symbol_index = (uint32_t)(symbol - libs[i].symbols);
 	    }
 	    /*
 	     * The symbol appears in this library.  Now see if it is
@@ -4754,9 +4797,9 @@ struct lib *lib)
     struct lib *ref_lib;
     uint32_t mh_flags;
     
-	module_index = module_state - lib->module_states;
+	module_index = (uint32_t)(module_state - lib->module_states);
 	dylib_module = lib->mods + module_index;
-	ilib = lib - libs;
+	ilib = (uint32_t)(lib - libs);
 
         if(lib->ofile->mh != NULL)
             mh_flags = lib->ofile->mh->flags;
@@ -5097,9 +5140,10 @@ struct lib *lib)
 			  symbol_name, arch_name);
 		    redo_exit(2);
 		}
-		symbol_index = symbol - symbols;
+		symbol_index = (uint32_t)(symbol - symbols);
 	    }
-	    indr_lib = get_primary_lib(libs - lib, symbols + symbol_index);
+	    indr_lib = get_primary_lib((uint32_t)(libs - lib),
+				       symbols + symbol_index);
 	}
 	return(indr_lib);
 }
@@ -5266,7 +5310,7 @@ struct indr_loop_list *indr_loop)
 		*module_state = &arch_state;
 		*lib = NULL;
 		if(itoc != NULL)
-		    *itoc = toc - arch_tocs;
+		    *itoc = (uint32_t)(toc - arch_tocs);
 		return(TRUE);
 	    }
 	}
@@ -5346,7 +5390,7 @@ struct indr_loop_list *indr_loop)
 	    *module_state = primary_lib->module_states + toc->module_index;
 	    *lib = primary_lib;
 	    if(itoc != NULL)
-		*itoc = toc - primary_lib->tocs;
+		*itoc = (uint32_t)(toc - primary_lib->tocs);
 	    return(TRUE);
 	}
 	*symbol = NULL;
@@ -5401,6 +5445,10 @@ enum bool missing_arch)
     enum link_state *module_state;
     struct lib *lib;
 
+	/* silence compiler warnings */
+	isub_image = 0;
+	itoc = 0;
+
 	/* the size of the symbol table will not change just the contents */
 	sym_info_size =
 	    arch_nextrel * sizeof(struct relocation_info) +
@@ -5453,9 +5501,19 @@ enum bool missing_arch)
 		arch->object->link_opt_hint_cmd->datasize;
 	}
 
+	if(arch->object->dyld_chained_fixups != NULL){
+	    sym_info_size +=
+		arch->object->dyld_chained_fixups->datasize;
+	}
+
+	if(arch->object->dyld_exports_trie != NULL){
+	    sym_info_size +=
+		arch->object->dyld_exports_trie->datasize;
+	}
+
 	if(arch->object->code_sig_cmd != NULL){
 	    sym_info_size =
-		rnd(sym_info_size, 16);
+		rnd32(sym_info_size, 16);
 	    sym_info_size +=
 		arch->object->code_sig_cmd->datasize;
 	}
@@ -5524,6 +5582,20 @@ enum bool missing_arch)
 		arch->object->link_opt_hint_cmd->dataoff;
 	    arch->object->output_link_opt_hint_info_data_size = 
 		arch->object->link_opt_hint_cmd->datasize;
+	}
+	if(arch->object->dyld_chained_fixups != NULL){
+	    arch->object->output_dyld_chained_fixups_data =
+		arch->object->object_addr +
+		arch->object->dyld_chained_fixups->dataoff;
+	    arch->object->output_dyld_chained_fixups_data_size =
+		arch->object->dyld_chained_fixups->datasize;
+	}
+	if(arch->object->dyld_exports_trie != NULL){
+	    arch->object->output_dyld_exports_trie_data =
+		arch->object->object_addr +
+		arch->object->dyld_exports_trie->dataoff;
+	    arch->object->output_dyld_exports_trie_data_size =
+		arch->object->dyld_exports_trie->datasize;
 	}
 	if(arch->object->code_sig_cmd != NULL){
 	    arch->object->output_code_sig_data = arch->object->object_addr +
@@ -9019,7 +9091,7 @@ uint32_t vmslide)
                                 */
                                 size = pbdylib1->cmdsize -
                                         (sizeof(struct prebound_dylib_command) +
-                                        rnd(strlen(dylib_name) + 1,
+                                        rnd32((uint32_t)strlen(dylib_name) + 1,
 					      sizeof(uint32_t)));
                                 /*
                                  * Now see if the size left has enought space to
@@ -9043,9 +9115,9 @@ uint32_t vmslide)
                                         nmodules = 64;
                                     size = sizeof(struct
 						  prebound_dylib_command) +
-                                     rnd(strlen(dylib_name)+1,
-					   sizeof(uint32_t)) +
-                                     rnd(nmodules / 8, sizeof(uint32_t));
+                                     rnd32((uint32_t)strlen(dylib_name)+1,
+					   (uint32_t)sizeof(uint32_t)) +
+                                     rnd32(nmodules / 8, sizeof(uint32_t));
                                     libs[i].LC_PREBOUND_DYLIB_size = size;
                                 }
                             }
@@ -9093,8 +9165,9 @@ uint32_t vmslide)
                     if(nmodules < 64)
                         nmodules = 64;
                     size = sizeof(struct prebound_dylib_command) +
-                    rnd(strlen(libs[i].dylib_name) + 1, sizeof(uint32_t))+
-                    rnd(nmodules / 8, sizeof(uint32_t));
+                    rnd32((uint32_t)strlen(libs[i].dylib_name) + 1,
+			  sizeof(uint32_t)) +
+			rnd32(nmodules / 8, sizeof(uint32_t));
                     libs[i].LC_PREBOUND_DYLIB_size = size;
                     sizeofcmds += libs[i].LC_PREBOUND_DYLIB_size;
                     ncmds++;
@@ -9183,11 +9256,11 @@ uint32_t vmslide)
                             pbdylib2->nmodules = libs[j].nmodtab;
                             pbdylib2->linked_modules.offset =
                                     sizeof(struct prebound_dylib_command) +
-                                    rnd(strlen(dylib_name) + 1,
+                                    rnd32((uint32_t)strlen(dylib_name) + 1,
 				    sizeof(uint32_t));
                             linked_modules = ((char *)pbdylib2) +
                                     sizeof(struct prebound_dylib_command) +
-                                    rnd(strlen(dylib_name) + 1,
+                                    rnd32((uint32_t)strlen(dylib_name) + 1,
 				    sizeof(uint32_t));
                             if(libs[j].ofile->mh != NULL)
                                 mh_flags = libs[j].ofile->mh->flags;
@@ -9230,11 +9303,11 @@ uint32_t vmslide)
                     pbdylib2->nmodules = libs[i].nmodtab;
                     pbdylib2->linked_modules.offset =
                             sizeof(struct prebound_dylib_command) +
-                            rnd(strlen(libs[i].dylib_name) + 1,
+                            rnd32((uint32_t)strlen(libs[i].dylib_name) + 1,
 			    sizeof(uint32_t));
                     linked_modules = ((char *)pbdylib2) +
                             sizeof(struct prebound_dylib_command) +
-                            rnd(strlen(libs[i].dylib_name) + 1,
+                            rnd32((uint32_t)strlen(libs[i].dylib_name) + 1,
 			    sizeof(uint32_t));
                     if(libs[i].ofile->mh != NULL)
                         mh_flags = libs[i].ofile->mh->flags;
@@ -9313,6 +9386,14 @@ uint32_t vmslide)
 		break;
 	    case LC_LINKER_OPTIMIZATION_HINT:
 		arch->object->link_opt_hint_cmd =
+		    (struct linkedit_data_command *)lc1;
+		break;
+	    case LC_DYLD_CHAINED_FIXUPS:
+		arch->object->dyld_chained_fixups =
+		    (struct linkedit_data_command *)lc1;
+		break;
+	    case LC_DYLD_EXPORTS_TRIE:
+		arch->object->dyld_exports_trie =
 		    (struct linkedit_data_command *)lc1;
 		break;
 	    }
@@ -9732,7 +9813,7 @@ char *
 savestr(
 const char *s)
 {
-    uint32_t len;
+    size_t len;
     char *r;
 
 	len = strlen(s) + 1;

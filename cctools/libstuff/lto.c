@@ -1,6 +1,7 @@
 #ifdef LTO_SUPPORT
 
 #include <stdio.h>
+#include <strings.h> /* cctools-port: For bcmp, bzero ... */
 #include <stdlib.h>
 #include <libc.h>
 #include <sys/file.h>
@@ -12,21 +13,28 @@
 #include <mach-o/nlist.h>
 #include <mach-o/dyld.h>
 
+/* cctools-port */
+#if LTO_API_VERSION < 5
+typedef unsigned char lto_bool_t;
+#endif
+/* cctools-port end */
+
 static int get_lto_cputype(
     struct arch_flag *arch_flag,
-    char *target_triple);
+    const char *target_triple);
 
 static int tried_to_load_lto = 0;
 static void *lto_handle = NULL;
-static int (*lto_is_object)(const void* mem, size_t length) = NULL;
+static lto_bool_t (*lto_is_object)(const void* mem, size_t length) = NULL;
 static lto_module_t (*lto_create)(const void* mem, size_t length) = NULL;
 static lto_module_t (*lto_create_local)(const void* mem, size_t length,
 					const char *path) = NULL;
 static void (*lto_dispose)(void *mod) = NULL;
-static char * (*lto_get_target)(void *mod) = NULL;
-static uint32_t (*lto_get_num_symbols)(void *mod) = NULL;
-static lto_symbol_attributes (*lto_get_sym_attr)(void *mod, uint32_t n) = NULL;
-static char * (*lto_get_sym_name)(void *mod, uint32_t n) = NULL;
+static const char * (*lto_get_target)(void *mod) = NULL;
+static unsigned int (*lto_get_num_symbols)(void *mod) = NULL;
+static lto_symbol_attributes (*lto_get_sym_attr)(void *mod,
+                              unsigned int n) = NULL;
+static const char * (*lto_get_sym_name)(void *mod, unsigned int n) = NULL;
 
 /*
  * is_llvm_bitcode() is passed an ofile struct pointer and a pointer and size
@@ -55,7 +63,7 @@ size_t size)
 	 *"llvm bitcode file" could be in an archive or fat file.
 	 */
 
-	if(is_llvm_bitcode_from_memory(addr, size, &arch_flag,
+	if(is_llvm_bitcode_from_memory(addr, (uint32_t)size, &arch_flag,
 				       &ofile->lto) != 0){
 	    ofile->lto_cputype = arch_flag.cputype;
 	    ofile->lto_cpusubtype = arch_flag.cpusubtype;
@@ -156,6 +164,7 @@ void **pmod) /* maybe NULL */
 	       lto_get_num_symbols == NULL ||
 	       lto_get_sym_attr == NULL ||
 	       lto_get_sym_name == NULL){
+		fprintf(stderr, "libLTO: %s", dlerror()); /* cctools-port */
 		dlclose(lto_handle);
 		if(lto_path != NULL)
 		    free(lto_path);
@@ -205,7 +214,7 @@ static
 int
 get_lto_cputype(
 struct arch_flag *arch_flag,
-char *target_triple)
+const char *target_triple)
 {
     char *p;
     size_t n;
@@ -291,6 +300,14 @@ char *target_triple)
 	else if(strncmp(target_triple, "arm64", n) == 0){
 	    arch_flag->cputype = CPU_TYPE_ARM64;
 	    arch_flag->cpusubtype = CPU_SUBTYPE_ARM64_ALL;
+	}
+	else if(strncmp(target_triple, "arm64e", n) == 0){
+	    arch_flag->cputype = CPU_TYPE_ARM64;
+	    arch_flag->cpusubtype = CPU_SUBTYPE_ARM64E;
+	}
+	else if(strncmp(target_triple, "arm64_32", n) == 0){
+	    arch_flag->cputype = CPU_TYPE_ARM64_32;
+	    arch_flag->cpusubtype = CPU_SUBTYPE_ARM64_32_V8;
 	}
 	else{
 	    return(0);
@@ -406,7 +423,7 @@ uint32_t symbol_index)
  * and returns the name of that symbol.
  */
 __private_extern__
-char *
+const char *
 lto_symbol_name(
 void *mod,
 uint32_t symbol_index)

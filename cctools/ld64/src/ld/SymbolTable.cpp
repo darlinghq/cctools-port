@@ -27,7 +27,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -117,31 +116,44 @@ bool SymbolTable::ReferencesHashFuncs::operator()(const ld::Atom* left, const ld
 }
 
 
-void SymbolTable::addDuplicateSymbol(const char *name, const ld::Atom *atom)
+void SymbolTable::addDuplicateSymbolError(const char* name, const ld::Atom* atom)
+{
+	addDuplicateSymbol(_duplicateSymbolErrors, name, atom);
+}
+
+void SymbolTable::addDuplicateSymbolWarning(const char* name, const ld::Atom* atom)
+{
+	addDuplicateSymbol(_duplicateSymbolWarnings, name, atom);
+}
+
+void SymbolTable::addDuplicateSymbol(DuplicateSymbols& dups, const char *name, const ld::Atom *atom)
 {
     // Look up or create the file list for name.
-    DuplicateSymbols::iterator symbolsIterator = _duplicateSymbols.find(name);
+    DuplicateSymbols::iterator symbolsIterator = dups.find(name);
     DuplicatedSymbolAtomList *atoms = NULL;
-    if (symbolsIterator != _duplicateSymbols.end()) {
+    if (symbolsIterator != dups.end()) {
         atoms = symbolsIterator->second;
-    } else {
-        atoms = new std::vector<const ld::Atom *>;
-        _duplicateSymbols.insert(std::pair<const char *, DuplicatedSymbolAtomList *>(name, atoms));
     }
-    
+    else {
+        atoms = new std::vector<const ld::Atom *>;
+        dups.insert(std::pair<const char *, DuplicatedSymbolAtomList *>(name, atoms));
+    }
+
     // check if file is already in the list, add it if not
     bool found = false;
     for (DuplicatedSymbolAtomList::iterator it = atoms->begin(); !found && it != atoms->end(); it++)
-        if (strcmp((*it)->file()->path(), atom->file()->path()) == 0)
+        if (strcmp((*it)->safeFilePath(), atom->safeFilePath()) == 0)
             found = true;
     if (!found)
         atoms->push_back(atom);
 }
 
+
 void SymbolTable::checkDuplicateSymbols() const
 {
+	// print duplicate errors
     bool foundDuplicate = false;
-    for (DuplicateSymbols::const_iterator symbolIt = _duplicateSymbols.begin(); symbolIt != _duplicateSymbols.end(); symbolIt++) {
+    for (DuplicateSymbols::const_iterator symbolIt = _duplicateSymbolErrors.begin(); symbolIt != _duplicateSymbolErrors.end(); symbolIt++) {
         DuplicatedSymbolAtomList *atoms = symbolIt->second;
         bool reportDuplicate;
         if (_options.deadCodeStrip()) {
@@ -156,20 +168,29 @@ void SymbolTable::checkDuplicateSymbols() const
         }
         if (reportDuplicate) {
             foundDuplicate = true;
-            fprintf(stderr, "duplicate symbol %s in:\n", symbolIt->first);
+            fprintf(stderr, "duplicate symbol '%s' in:\n", _options.demangleSymbol(symbolIt->first));
             for (DuplicatedSymbolAtomList::iterator atomIt = atoms->begin(); atomIt != atoms->end(); atomIt++) {
-                fprintf(stderr, "    %s\n", (*atomIt)->file()->path());
+                fprintf(stderr, "    %s\n", (*atomIt)->safeFilePath());
             }
         }
     }
     if (foundDuplicate)
-        throwf("%d duplicate symbol%s", (int)_duplicateSymbols.size(), _duplicateSymbols.size()==1?"":"s");
+        throwf("%d duplicate symbol%s", (int)_duplicateSymbolErrors.size(), _duplicateSymbolErrors.size()==1?"":"s");
+
+	// print duplicates warnings
+    for (DuplicateSymbols::const_iterator symbolIt = _duplicateSymbolWarnings.begin(); symbolIt != _duplicateSymbolWarnings.end(); symbolIt++) {
+        std::string msg = "duplicate symbol '" + std::string(_options.demangleSymbol(symbolIt->first)) + "' in:";
+		for (const ld::Atom* atom : *symbolIt->second) {
+			msg += "\n    " + std::string(atom->safeFilePath());
+		}
+		warning("%s", msg.c_str());
+    }
 }
 
 // AtomPicker encapsulates the logic for picking which atom to use when adding an atom by name results in a collision
 class NameCollisionResolution {
 public:
-	NameCollisionResolution(const ld::Atom& a, const ld::Atom& b, bool ignoreDuplicates, const Options& options) : _atomA(a), _atomB(b), _options(options), _reportDuplicate(false), _ignoreDuplicates(ignoreDuplicates) {
+	NameCollisionResolution(const ld::Atom& a, const ld::Atom& b, Options::Treatment duplicates, const Options& options) : _atomA(a), _atomB(b), _options(options), _reportDuplicate(false), _duplicates(duplicates) {
 		pickAtom();
 	}
 	
@@ -178,15 +199,16 @@ public:
 	bool choseAtom(const ld::Atom& atom) { return _chosen == &atom; }
 
 	// Returns true if the two atoms should be reported as a duplicate symbol
-	bool reportDuplicate()  { return _reportDuplicate; }
-	
+	bool reportDuplicateError()    { return _reportDuplicate && (_duplicates == Options::Treatment::kError); }
+	bool reportDuplicateWarning()  { return _reportDuplicate && (_duplicates == Options::Treatment::kWarning); }
+
 private:
 	const ld::Atom& _atomA;
 	const ld::Atom& _atomB;
 	const Options& _options;
 	const ld::Atom* _chosen;
 	bool _reportDuplicate;
-	bool _ignoreDuplicates;
+	Options::Treatment _duplicates;
 
 	void pickAtom(const ld::Atom& atom) { _chosen = &atom; } // primitive to set which atom is picked
 	void pickAtomA() { pickAtom(_atomA); }	// primitive to pick atom A
@@ -266,11 +288,19 @@ private:
 					pickAtomB();
 				} 
 				else {
-					if ( _ignoreDuplicates ) {
-						pickLowerOrdinal();
-					}
-					else {
-						_reportDuplicate = true;
+					switch (_duplicates) {
+						case Options::Treatment::kError:
+							_reportDuplicate = true;
+							break;
+						case Options::Treatment::kWarning:
+							pickLowerOrdinal();
+							_reportDuplicate = true;
+							break;
+						case Options::Treatment::kSuppress:
+							pickLowerOrdinal();
+							break;
+						default:
+							break;
 					}
 				}
 			}
@@ -284,18 +314,18 @@ private:
 			case Options::kCommonsIgnoreDylibs:
 				if ( _options.warnCommons() )
 					warning("using common symbol %s from %s and ignoring defintion from dylib %s",
-							proxy.name(), proxy.file()->path(), dylib.file()->path());
+							proxy.name(), proxy.safeFilePath(), dylib.safeFilePath());
 				pickAtom(dylib);
 				break;
 			case Options::kCommonsOverriddenByDylibs:
 				if ( _options.warnCommons() )
 					warning("replacing common symbol %s from %s with true definition from dylib %s",
-							proxy.name(), proxy.file()->path(), dylib.file()->path());
+							proxy.name(), proxy.safeFilePath(), dylib.safeFilePath());
 				pickAtom(proxy);
 				break;
 			case Options::kCommonsConflictsDylibsError:
 				throwf("common symbol %s from %s conflicts with defintion from dylib %s",
-					   proxy.name(), proxy.file()->path(), dylib.file()->path());
+					   proxy.name(), proxy.safeFilePath(), dylib.safeFilePath());
 		}
 	}
 	
@@ -307,7 +337,7 @@ private:
 		} else if ( _atomB.combine() == ld::Atom::combineByName ) {
 			pickAtomA();
 		} else {
-				throwf("symbol %s exported from both %s and %s\n", _atomA.name(), _atomA.file()->path(), _atomB.file()->path());
+				throwf("symbol %s exported from both %s and %s\n", _atomA.name(), _atomA.safeFilePath(), _atomB.safeFilePath());
 		}
 	}
 	
@@ -322,10 +352,8 @@ private:
 						break;
 					case ld::Atom::definitionTentative:
 						if ( _atomB.size() > _atomA.size() ) {
-							const char* atomApath = (_atomA.file() != NULL) ? _atomA.file()->path() : "<internal>";
-							const char* atomBpath = (_atomB.file() != NULL) ? _atomB.file()->path() : "<internal>";
 							warning("tentative definition of '%s' with size %llu from '%s' is being replaced by real definition of smaller size %llu from '%s'",
-									_atomA.name(), _atomB.size(), atomBpath, _atomA.size(), atomApath);
+									_atomA.name(), _atomB.size(), _atomB.safeFilePath(), _atomA.size(), _atomA.safeFilePath());
 						}
 						pickAtomA();
 						break;
@@ -342,10 +370,8 @@ private:
 				switch (_atomB.definition()) {
 					case ld::Atom::definitionRegular:
 						if ( _atomA.size() > _atomB.size() ) {
-							const char* atomApath = (_atomA.file() != NULL) ? _atomA.file()->path() : "<internal>";
-							const char* atomBpath = (_atomB.file() != NULL) ? _atomB.file()->path() : "<internal>";
 							warning("tentative definition of '%s' with size %llu from '%s' is being replaced by real definition of smaller size %llu from '%s'",
-									_atomA.name(), _atomA.size(),atomApath, _atomB.size(), atomBpath);
+									_atomA.name(), _atomA.size(),_atomA.safeFilePath(), _atomB.size(), _atomB.safeFilePath());
 						}
 						pickAtomB();
 						break;
@@ -408,7 +434,7 @@ private:
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
 
-bool SymbolTable::addByName(const ld::Atom& newAtom, bool ignoreDuplicates)
+bool SymbolTable::addByName(const ld::Atom& newAtom, Options::Treatment duplicates)
 {
 	bool useNew = true;
 	assert(newAtom.name() != NULL);
@@ -418,10 +444,14 @@ bool SymbolTable::addByName(const ld::Atom& newAtom, bool ignoreDuplicates)
 	//fprintf(stderr, "addByName(%p) name=%s, slot=%u, existing=%p\n", &newAtom, newAtom.name(), slot, existingAtom);
 	if ( existingAtom != NULL ) {
 		assert(&newAtom != existingAtom);
-		NameCollisionResolution picker(newAtom, *existingAtom, ignoreDuplicates, _options);
-		if (picker.reportDuplicate()) {
-			addDuplicateSymbol(name, existingAtom);
-			addDuplicateSymbol(name, &newAtom);
+		NameCollisionResolution picker(newAtom, *existingAtom, duplicates, _options);
+		if ( picker.reportDuplicateError() ) {
+			addDuplicateSymbolError(name, existingAtom);
+			addDuplicateSymbolError(name, &newAtom);
+		}
+		else if ( picker.reportDuplicateWarning() ) {
+			addDuplicateSymbolWarning(name, existingAtom);
+			addDuplicateSymbolWarning(name, &newAtom);
 		}
 		useNew = picker.choseAtom(newAtom);
 	}
@@ -496,14 +526,14 @@ bool SymbolTable::addByReferences(const ld::Atom& newAtom)
 }
 
 
-bool SymbolTable::add(const ld::Atom& atom, bool ignoreDuplicates)
+bool SymbolTable::add(const ld::Atom& atom, Options::Treatment duplicates)
 {
 	//fprintf(stderr, "SymbolTable::add(%p), name=%s\n", &atom, atom.name());
 	assert(atom.scope() != ld::Atom::scopeTranslationUnit);
 	switch ( atom.combine() ) {
 		case ld::Atom::combineNever:
 		case ld::Atom::combineByName:
-			return this->addByName(atom, ignoreDuplicates);
+			return this->addByName(atom, duplicates);
 			break;
 		case ld::Atom::combineByNameAndContent:
 			return this->addByContent(atom);
@@ -519,7 +549,7 @@ bool SymbolTable::add(const ld::Atom& atom, bool ignoreDuplicates)
 void SymbolTable::markCoalescedAway(const ld::Atom* atom)
 {
 	// remove this from list of all atoms used
-	//fprintf(stderr, "markCoalescedAway(%p) from %s\n", atom, atom->file()->path());
+	//fprintf(stderr, "markCoalescedAway(%p) from %s\n", atom, atom->safeFilePath());
 	(const_cast<ld::Atom*>(atom))->setCoalescedAway();
 	
 	//
@@ -878,6 +908,41 @@ const ld::Atom* SymbolTable::indirectAtom(IndirectBindingSlot slot) const
 	return _indirectBindingTable[slot];
 }
 
+
+void SymbolTable::removeDeadUndefs(std::vector<const ld::Atom*>& allAtoms, const std::unordered_set<const ld::Atom*>& keep)
+{
+	// mark the indirect entries in use
+	std::vector<bool> indirectUsed;
+	for (size_t i=0; i < _indirectBindingTable.size(); ++i)
+		indirectUsed.push_back(false);
+	for (const ld::Atom* atom : allAtoms) {
+		for (auto it = atom->fixupsBegin(); it != atom->fixupsEnd(); ++it) {
+			switch (it->binding) {
+				case ld::Fixup::bindingsIndirectlyBound:
+					indirectUsed[it->u.bindingIndex] = true;
+					break;
+				default:
+					break;
+			}
+		}
+	}
+
+	// any indirect entry not in use which points to an undefined proxy can be removed
+	for (size_t slot=0; slot < indirectUsed.size(); ++slot) {
+		if ( !indirectUsed[slot] ) {
+			const ld::Atom* atom = _indirectBindingTable[slot];
+			if ( (atom != nullptr) && (atom->definition() == ld::Atom::definitionProxy) && (keep.count(atom) == 0) ) {
+				const char* name = atom->name();
+				_indirectBindingTable[slot] = NULL;
+				_byNameReverseTable.erase(slot);
+				_byNameTable.erase(name);
+				allAtoms.erase(std::remove(allAtoms.begin(), allAtoms.end(), atom), allAtoms.end());
+			}
+		}
+	}
+
+}
+
 void SymbolTable::printStatistics()
 {
 //	fprintf(stderr, "cstring table size: %lu, bucket count: %lu, hash func called %u times\n", 
@@ -907,7 +972,7 @@ void SymbolTable::printStatistics()
 	//ReferencesHash obj;
 	//for(ReferencesHashToSlot::iterator it=_byReferencesTable.begin(); it != _byReferencesTable.end(); ++it) {
 	//	if ( obj.operator()(it->first) == 0x2F3AC0EAC744EA70 ) {
-	//		fprintf(stderr, "hash=0x2F3AC0EAC744EA70 for %p %s from %s\n", it->first, it->first->name(), it->first->file()->path());
+	//		fprintf(stderr, "hash=0x2F3AC0EAC744EA70 for %p %s from %s\n", it->first, it->first->name(), it->first->safeFilePath());
 	//	
 	//	}
 	//}

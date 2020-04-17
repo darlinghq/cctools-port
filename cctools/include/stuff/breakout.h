@@ -36,7 +36,7 @@
  */
 struct toc_entry {
     char *symbol_name;
-    int32_t member_index;
+    int64_t member_index;
 };
 
 /*
@@ -50,9 +50,10 @@ struct arch {
     enum ofile_type type;	/* The type of file for this architecture */
 				/*  can be OFILE_ARCHIVE, OFILE_Mach_O, */
     				/*  OFILE_LLVM_BITCODE or OFILE_UNKNOWN. */
-    struct fat_arch *fat_arch;	/* If this came from fat file this is valid */
-			        /*  and not NULL (needed for the align value */
-				/*  and to output a fat file if only one arch)*/
+    struct fat_arch *fat_arch;	/* If this came from fat file one of these */
+    struct fat_arch_64		/* is valid and not NULL (needed for the */
+		    *fat_arch64;/* align value and to output a fat file if */
+				/* only one arch) */
     char *fat_arch_name;	/* If this came from fat file this is valid */
 				/*  and is tthe name of this architecture */
 				/*  (used for error messages). */
@@ -71,13 +72,15 @@ struct arch {
     enum bool      toc_long_name;/* use the long name in the output */
     char	  *toc_name;	 /* name of toc member */
     uint32_t       toc_name_size;/* size of name of toc member */
-    uint32_t       ntocs;	/* number of table of contents entries */
+    uint64_t       ntocs;	/* number of table of contents entries */
+    enum bool	   using_64toc; /* TRUE if we are using a 64-bit toc */
     struct toc_entry
 		  *toc_entries; /* the table of contents entries */
-    struct ranlib *toc_ranlibs;	/* the ranlib structs */
+    struct ranlib *toc_ranlibs;	/* the 32-bit ranlib structs */
+    struct ranlib_64 *toc_ranlibs64; /* the 64-bit ranlib structs */
     char	  *toc_strings;	/* strings of symbol names for toc entries */
-    uint32_t       toc_strsize;	/* number of bytes for the strings above */
-    uint32_t	  library_size;	/* current working size and final output size */
+    uint64_t       toc_strsize;	/* number of bytes for the strings above */
+    uint64_t	  library_size;	/* current working size and final output size */
 				/*  for this arch when it's a library (used */
 				/*  for creating the toc entries). */
 
@@ -91,7 +94,7 @@ struct arch {
 
     /* if this is an unknown file: the addr and size of the file */
     char *unknown_addr;
-    uint32_t unknown_size;
+    uint64_t unknown_size;
 
     /* don't update LC_ID_DYLIB timestamp */
     enum bool dont_update_LC_ID_DYLIB_timestamp;
@@ -101,7 +104,7 @@ struct member {
     enum ofile_type type;	/* the type of this member can be OFILE_Mach_O*/
 				/*  OFILE_LLVM_BITCODE or OFILE_UNKNOWN */
     struct ar_hdr *ar_hdr;	/* the archive header for this member */
-    uint32_t offset;		/* current working offset and final offset */
+    uint64_t offset;		/* current working offset and final offset */
 				/*  use in creating the table of contents */
 
     /* the name of the member in the output */
@@ -120,7 +123,7 @@ struct member {
 
     /* if this member is an unknown file: the addr and size of the member */
     char *unknown_addr;
-    uint32_t unknown_size;
+    uint64_t unknown_size;
 
     /*
      * If this member was created from a file then input_file_name is set else
@@ -173,6 +176,10 @@ struct object {
     struct section_64 **sections64; /* array of 64-bit section structs */
     struct dyld_info_command
 	*dyld_info;		    /* the LC_DYLD_INFO command,if any */
+    struct linkedit_data_command
+	*dyld_exports_trie;	    /* the exports trie */
+    struct linkedit_data_command
+	*dyld_chained_fixups;	    /* the fixups */
 
     /*
      * This is only used for redo_prebinding and is calculated by breakout()
@@ -207,6 +214,11 @@ struct object {
     uint32_t      output_nsymbols;
     char	 *output_strings;
     uint32_t      output_strings_size;
+    /*
+     * To get the code signature data on a page alignment and be compatible with
+     * existing tools we have to actually change the string table and pad it.
+     */
+    uint32_t      output_strings_size_pad;
     char *output_code_sig_data;
     uint32_t      output_code_sig_data_size;
     char *output_split_info_data;
@@ -219,6 +231,10 @@ struct object {
     uint32_t      output_code_sign_drs_info_data_size;
     char *output_link_opt_hint_info_data;
     uint32_t      output_link_opt_hint_info_data_size;
+    char *output_dyld_chained_fixups_data;
+    uint32_t      output_dyld_chained_fixups_data_size;
+    char *output_dyld_exports_trie_data;
+    uint32_t      output_dyld_exports_trie_data_size;
 
     uint32_t      output_ilocalsym;
     uint32_t      output_nlocalsym;
@@ -275,6 +291,7 @@ __private_extern__ void writeout(
     unsigned short mode,
     enum bool sort_toc,
     enum bool commons_in_toc,
+    enum bool force_64bit_toc,
     enum bool library_warnings,
     uint32_t *throttle);
 
@@ -283,9 +300,10 @@ __private_extern__ void writeout_to_mem(
     uint32_t narchs,
     char *filename,
     void **outputbuf,
-    uint32_t *length,
+    uint64_t *length,
     enum bool sort_toc,
     enum bool commons_in_toc,
+    enum bool force_64bit_toc,
     enum bool library_warning,
     enum bool *seen_archive);
 

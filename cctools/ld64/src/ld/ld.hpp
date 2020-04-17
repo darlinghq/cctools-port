@@ -30,17 +30,225 @@
 #include <math.h>
 #include <unistd.h>
 #include <assert.h>
-#include "configure.h"
 
 #include <set>
 #include <map>
 #include <vector>
 #include <string>
 #include <unordered_set>
+#include <algorithm> // ld64-port: for std::find_if
 
-#include "configure.h" // ld64-port
+#include "configure.h"
+#include "PlatformSupport.h"
+
+//FIXME: Only needed until we move VersionSet into PlatformSupport
+class Options;
 
 namespace ld {
+
+//
+// minumum OS versions
+//
+
+struct PlatformVersion {
+	Platform platform;
+	uint32_t minVersion;
+	uint32_t sdkVersion;
+	PlatformVersion(Platform P) : PlatformVersion(P, 0, 0) {}
+	PlatformVersion(Platform P, uint32_t V) : PlatformVersion(P, V, V) {}
+	PlatformVersion(Platform P, uint32_t M, uint32_t S) : platform(P), minVersion(M), sdkVersion(S) {}
+	bool operator==(const PlatformVersion& other) const { return platform == other.platform; }
+	bool operator<(const PlatformVersion& other) const { return platform < other.platform; }
+};
+
+struct VersionSet {
+private:
+	std::set<PlatformVersion> _versions;
+public:
+	VersionSet() {}
+	VersionSet(const std::set<PlatformVersion>& V) : _versions(V) {}
+	void insert(PlatformVersion platformVersion) {
+		assert(_versions.find(platformVersion) == _versions.end());
+		_versions.insert(platformVersion);
+	}
+	void erase(const Platform& platform) {
+		auto i = std::find_if(_versions.begin(), _versions.end(), [&platform](const PlatformVersion& version) {
+			return platform == version.platform;
+		});
+		if (i == _versions.end()) return;
+		_versions.erase(i);
+	}
+	void updateMinVersion(const Platform& platform, uint32_t minVersion) {
+		auto i = std::find_if(_versions.begin(), _versions.end(), [&platform](const PlatformVersion& version) {
+			return platform == version.platform;
+		});
+		if (i == _versions.end()) return;
+		auto newVersion = *i;
+		newVersion.minVersion = minVersion;
+		newVersion.sdkVersion = i->sdkVersion;
+		_versions.erase(i);
+		_versions.insert(newVersion);
+	}
+	void updateSDKVersion(const Platform& platform, uint32_t sdkVersion) {
+		auto i = std::find_if(_versions.begin(), _versions.end(), [&platform](const PlatformVersion& version) {
+			return platform == version.platform;
+		});
+		if (i == _versions.end()) return;
+		auto newVersion = *i;
+		newVersion.minVersion = i->minVersion;
+		newVersion.sdkVersion = sdkVersion;
+		_versions.erase(i);
+		_versions.insert(newVersion);
+	}
+	size_t count() const { return _versions.size(); }
+	size_t empty() const { return _versions.empty(); }
+	void   clear() { _versions.clear(); }
+
+	void forEach(void (^callback)(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop)) const {
+		bool stop = false;
+		for (const auto& version : _versions) {
+			callback(version.platform, version.minVersion, version.sdkVersion, stop);
+			if (stop)
+				return;
+		}
+	}
+
+	bool contains(ld::Platform platform) const {
+		auto i = std::find_if(_versions.begin(), _versions.end(), [&platform](const PlatformVersion& version) {
+			return platform == version.platform;
+		});
+		return (i != _versions.end());
+	}
+
+	bool contains(const ld::PlatformSet& platforms) const {
+		__block bool retval = true;
+		forEach(^(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop) {
+			if (platforms.find(platform) == platforms.end()) {
+				stop = true;
+				retval = false;
+			}
+		});
+		return retval;
+	}
+
+	uint32_t minOS(ld::Platform platform) const {
+		for (const auto& version : _versions) {
+			if (basePlatform(version.platform) == platform) {
+				return version.minVersion;
+			}
+		}
+		return 0;
+	}
+
+	bool minOS(const PlatformVersion& version) const {
+		return minOS(version.platform) >= version.minVersion;
+	}
+
+	bool minOS(const ld::VersionSet& requiredMinVersions) const {
+		__block bool retval = true;
+		forEach(^(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop) {
+			if (!requiredMinVersions.contains(basePlatform(platform)))
+				return;
+			if (minVersion < requiredMinVersions.minOS(basePlatform(platform))) {
+				stop = true;
+				retval = false;
+			}
+		});
+		return retval;
+	}
+
+	std::string to_str() const {
+		std::string retval;
+		auto appendPlatform = [&](const std::string& platform) {
+			if (retval.empty()) {
+				retval = platform;
+			} else {
+				retval += "/";
+				retval += platform;
+			}
+		};
+
+		forEach(^(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop) {
+			appendPlatform(platformInfo(platform).printName);
+		});
+
+		return retval;
+	}
+
+	void checkObjectCrosslink(const VersionSet& objectPlatforms, const std::string& targetPath, bool internalSDK,
+							  bool bitcode) const;
+	void checkDylibCrosslink(const VersionSet& dylibPlatforms, const std::string& targetPath,
+										 const std::string& dylibType, bool internalSDK, bool indirectDylib,
+										 bool bitcode) const;
+	bool operator==(const VersionSet& other) const { return _versions == other._versions; }
+	bool operator<(const VersionSet& other) const { return _versions < other._versions; }
+};
+
+static const PlatformVersion mac10_4		(Platform::macOS, 0x000A0400);
+static const PlatformVersion mac10_5		(Platform::macOS, 0x000A0500);
+static const PlatformVersion mac10_6 		(Platform::macOS, 0x000A0600);
+static const PlatformVersion mac10_7 		(Platform::macOS, 0x000A0700);
+static const PlatformVersion mac10_8 		(Platform::macOS, 0x000A0800);
+static const PlatformVersion mac10_9 		(Platform::macOS, 0x000A0900);
+static const PlatformVersion mac10_12 		(Platform::macOS, 0x000A0C00);
+static const PlatformVersion mac10_14 		(Platform::macOS, 0x000A0E00);
+static const PlatformVersion mac10_15		(Platform::macOS, 0x000A0F00);
+static const PlatformVersion mac10_Future 	(Platform::macOS, 0x10000000);
+
+static const PlatformVersion iOS_2_0 		(Platform::iOS, 0x00020000);
+static const PlatformVersion iOS_3_1 		(Platform::iOS, 0x00030100);
+static const PlatformVersion iOS_4_2 		(Platform::iOS, 0x00040200);
+static const PlatformVersion iOS_4_3 		(Platform::iOS, 0x00040300);
+static const PlatformVersion iOS_5_0 		(Platform::iOS, 0x00050000);
+static const PlatformVersion iOS_6_0 		(Platform::iOS, 0x00060000);
+static const PlatformVersion iOS_7_0 		(Platform::iOS, 0x00070000);
+static const PlatformVersion iOS_8_0 		(Platform::iOS, 0x00080000);
+static const PlatformVersion iOS_9_0 		(Platform::iOS, 0x00090000);
+static const PlatformVersion iOS_10_0 		(Platform::iOS, 0x000A0000);
+static const PlatformVersion iOS_11_0 		(Platform::iOS, 0x000B0000);
+static const PlatformVersion iOS_12_0 		(Platform::iOS, 0x000C0000);
+static const PlatformVersion iOS_13_0 		(Platform::iOS, 0x000D0000);
+static const PlatformVersion iOS_Future 	(Platform::iOS, 0x10000000);
+
+static const PlatformVersion watchOS_1_0 		(Platform::watchOS, 0x00010000);
+static const PlatformVersion watchOS_2_0 		(Platform::watchOS, 0x00020000);
+static const PlatformVersion watchOS_5_0 		(Platform::watchOS, 0x00050000);
+static const PlatformVersion watchOS_6_0 		(Platform::watchOS, 0x00060000);
+static const PlatformVersion watchOS_Future		(Platform::watchOS, 0x10000000);
+
+static const PlatformVersion tvOS_9_0 			(Platform::tvOS, 0x00090000);
+static const PlatformVersion tvOS_12_0 			(Platform::tvOS, 0x000C0000);
+static const PlatformVersion tvOS_13_0 			(Platform::tvOS, 0x000D0000);
+static const PlatformVersion tvOS_Future		(Platform::tvOS, 0x10000000);
+
+static const PlatformVersion bridgeOS_1_0 			(Platform::bridgeOS, 0x00010000);
+static const PlatformVersion bridgeOS_4_0 			(Platform::bridgeOS, 0x00040000);
+static const PlatformVersion bridgeOS_Future		(Platform::bridgeOS, 0x10000000);
+
+
+// Platform Sets
+
+static const PlatformSet simulatorPlatforms ( {Platform::iOS_simulator, Platform::tvOS_simulator, Platform::watchOS_simulator} );
+
+//FIXME do we need to add simulatots to these?
+//FIXME Are the dates correct?
+static const VersionSet version2007		({mac10_4, iOS_2_0});
+static const VersionSet version2008 	({mac10_5, iOS_2_0});
+static const VersionSet version2008Fall ({mac10_5, iOS_3_1});
+static const VersionSet version2009 	({mac10_6, iOS_3_1});
+static const VersionSet version2010 	({mac10_7, iOS_4_2});
+static const VersionSet version2010Fall ({mac10_7, iOS_4_3});
+
+static const VersionSet version2012 	({mac10_8, iOS_6_0});
+static const VersionSet version2013 	({mac10_9, iOS_7_0});
+static const VersionSet version2019Fall ({mac10_15, iOS_13_0, watchOS_6_0, tvOS_13_0, bridgeOS_4_0});
+
+static const VersionSet supportsSplitSegV2 		({mac10_12, iOS_9_0, watchOS_2_0, tvOS_9_0});
+// FIXME: Use the comment out line instead.
+static const VersionSet supportsLCBuildVersion 	({mac10_14, iOS_12_0, watchOS_5_0, tvOS_12_0, bridgeOS_1_0});
+static const VersionSet supportsPIE				({mac10_5, iOS_4_2});
+static const VersionSet supportsTLV  			({mac10_7, iOS_9_0});
+static const VersionSet supportsChainedFixups 	({mac10_15, iOS_13_0, watchOS_6_0, tvOS_13_0, bridgeOS_Future});
 
 // Forward declaration for bitcode support
 class Bitcode;
@@ -59,10 +267,7 @@ class Bitcode;
 class File
 {
 public:
-	enum ObjcConstraint { objcConstraintNone, objcConstraintRetainRelease, 
-							objcConstraintRetainReleaseOrGC, objcConstraintGC,
-							objcConstraintRetainReleaseForSimulator };
-	
+
 	class AtomHandler {
 	public:
 		virtual				~AtomHandler() {}
@@ -94,7 +299,7 @@ public:
 		
 		Ordinal (uint64_t ordinal) : _ordinal(ordinal) {}
 		
-		enum { kArgListPartition=0, kIndirectDylibPartition=1, kLTOPartition = 2, kLinkerOptionPartition = 2, InvalidParition=0xffff };
+		enum { kArgListPartition=0, kIndirectDylibPartition=1, kLTOPartition = 2, kLinkerOptionPartition = 3, InvalidParition=0xffff };
 		Ordinal(uint16_t partition, uint16_t majorIndex, uint16_t minorIndex, uint16_t counter) {
 			_ordinal = ((uint64_t)partition<<48) | ((uint64_t)majorIndex<<32) | ((uint64_t)minorIndex<<16) | ((uint64_t)counter<<0);
 		}
@@ -103,14 +308,14 @@ public:
 		const uint16_t	majorIndex() const		{ return (_ordinal>>32)&0xffff; }
 		const uint16_t	minorIndex() const		{ return (_ordinal>>16)&0xffff; }
 		const uint16_t	counter() const			{ return (_ordinal>>00)&0xffff; }
-		
+
 		const Ordinal nextMajorIndex()		const { assert(majorIndex() < 0xffff); return Ordinal(_ordinal+((uint64_t)1<<32)); }
 		const Ordinal nextMinorIndex()		const { assert(minorIndex() < 0xffff); return Ordinal(_ordinal+((uint64_t)1<<16)); }
 		const Ordinal nextCounter()		const { assert(counter() < 0xffff); return Ordinal(_ordinal+((uint64_t)1<<0)); }
 		
 	public:
 		Ordinal() : _ordinal(0) {};
-		
+
 		static const Ordinal NullOrdinal()		{ return Ordinal((uint64_t)0); }
 		
 		const bool validOrdinal() const { return _ordinal != 0; }
@@ -127,7 +332,7 @@ public:
 		// Thus, an object pulled in from a .a that was listed in a file list could use all three fields.
 		static const Ordinal makeArgOrdinal(uint16_t argIndex) { return Ordinal(kArgListPartition, argIndex, 0, 0); };
 		const Ordinal nextFileListOrdinal() const { return nextMinorIndex(); }
-		const Ordinal archiveOrdinalWithMemberIndex(uint16_t index) const { return Ordinal(kArgListPartition, majorIndex(), minorIndex(), index); }
+		const Ordinal archiveOrdinalWithMemberIndex(uint16_t memberIndex) const { return Ordinal(partition(), majorIndex(), minorIndex(), memberIndex); }
 		
 		// For indirect libraries the partition is IndirectDylibPartition and the counter is used or order the libraries.
 		static const ld::File::Ordinal indirectDylibBase() { return Ordinal(kIndirectDylibPartition, 0, 0, 0); }
@@ -138,8 +343,8 @@ public:
 
 		// For linker options embedded in object files
 		static const ld::File::Ordinal linkeOptionBase() { return Ordinal(kIndirectDylibPartition, 1, 0, 0); }
-		const Ordinal nextLinkerOptionOrdinal() { nextCounter(); return *this; };
-		
+		const Ordinal nextLinkerOptionOrdinal() { return nextCounter(); };
+
 	};
 	
 	typedef enum { Reloc, Dylib, Archive, Other } Type;
@@ -152,34 +357,33 @@ public:
 	Ordinal								ordinal() const			{ return _ordinal; }
 	virtual bool						forEachAtom(AtomHandler&) const = 0;
 	virtual bool						justInTimeforEachAtom(const char* name, AtomHandler&) const = 0;
-	virtual ObjcConstraint				objCConstraint() const			{ return objcConstraintNone; }
-	virtual uint8_t						swiftVersion() const			{ return 0; }
+	virtual uint8_t						swiftVersion() const	{ return 0; }		// ABI version, now fixed
+	virtual uint16_t					swiftLanguageVersion() const	{ return 0; }	// language version in 4.4 format
 	virtual uint32_t					cpuSubType() const		{ return 0; }
 	virtual uint32_t					subFileCount() const	{ return 1; }
-	virtual uint32_t					minOSVersion() const	{ return 0; }
-	virtual uint32_t					platformLoadCommand() const		{ return 0; }
+	virtual const VersionSet&			platforms() const		{ return _platforms; }
     bool								fileExists() const     { return _modTime != 0; }
 	Type								type() const { return _type; }
 	virtual Bitcode*					getBitcode() const		{ return NULL; }
+	const char*							leafName() const;
+
 private:
 	const char*							_path;
 	time_t								_modTime;
 	const Ordinal						_ordinal;
 	const Type							_type;
+	// Note this is just a placeholder as platforms() needs something to return
+	static const VersionSet				_platforms;
 };
 
 
-//
-// minumum OS versions
-//
-enum MacVersionMin { macVersionUnset=0, mac10_4=0x000A0400, mac10_5=0x000A0500, 
-						mac10_6=0x000A0600, mac10_7=0x000A0700, mac10_8=0x000A0800,
-						mac10_9=0x000A0900, mac10_Future=0x10000000 };
-enum IOSVersionMin { iOSVersionUnset=0, iOS_2_0=0x00020000, iOS_3_1=0x00030100, 
-						iOS_4_2=0x00040200, iOS_4_3=0x00040300, iOS_5_0=0x00050000,
-						iOS_6_0=0x00060000, iOS_7_0=0x00070000, iOS_8_0=0x00080000,
-						iOS_9_0=0x00090000, iOS_Future=0x10000000};
-enum WatchOSVersionMin  { wOSVersionUnset=0, wOS_1_0=0x00010000, wOS_2_0=0x00020000 };
+inline const char* File::leafName() const {
+	const char* pth = this->path();
+	if ( pth == NULL )
+		return "<internal>";
+	const char* lastSlash = strrchr(pth, '/');
+	return (lastSlash != NULL) ? lastSlash+1 : pth;
+}
 
 
 namespace relocatable {
@@ -213,6 +417,8 @@ namespace relocatable {
 			const char*			string;
 		};
 		typedef const std::vector< std::vector<const char*> > LinkerOptionsList;
+		typedef std::vector<std::pair<uint32_t,uint32_t>> ToolVersionList;
+		struct AstTimeAndPath { uint64_t time; std::string path; };
 
 											File(const char* pth, time_t modTime, Ordinal ord)
 												: ld::File(pth, modTime, ord, Reloc) { }
@@ -223,8 +429,14 @@ namespace relocatable {
 		virtual const std::vector<Stab>*	stabs() const = 0;
 		virtual bool						canScatterAtoms() const = 0;
 		virtual bool						hasLongBranchStubs()		{ return false; }
+		virtual bool						hasllvmProfiling() const    { return false; }
+		virtual bool  						hasObjC() const				{ return false; }
+		virtual bool						objcHasCategoryClassPropertiesField() const { return false; }
 		virtual LinkerOptionsList*			linkerOptions() const = 0;
+		virtual const ToolVersionList&		toolVersions() const = 0;
 		virtual SourceKind					sourceKind() const { return kSourceUnknown; }
+		virtual const uint8_t*				fileContent() const { return nullptr; }
+		virtual const std::vector<AstTimeAndPath>*	astFiles() const { return nullptr; }
 	};
 } // namespace relocatable
 
@@ -243,13 +455,13 @@ namespace dylib {
 		{
 		public:
 			virtual				~DylibHandler()	{}
-			virtual File*		findDylib(const char* installPath, const char* fromPath) = 0;
+			virtual File*		findDylib(const char* installPath, const ld::dylib::File* fromDylib, bool speculative) = 0;
 		};
 			
 											File(const char* pth, time_t modTime, Ordinal ord)
 												: ld::File(pth, modTime, ord, Dylib), _dylibInstallPath(NULL), _frameworkName(NULL),
 												_dylibTimeStamp(0), _dylibCurrentVersion(0), _dylibCompatibilityVersion(0),
-												_explicitlyLinked(false), _implicitlyLinked(false),
+												_explicitlyLinked(false), _implicitlyLinked(false), _speculativelyLoaded(false),
 												_lazyLoadedDylib(false), _forcedWeakLinked(false), _reExported(false),
 												_upward(false), _dead(false) { }
 				const char*					installPath() const			{ return _dylibInstallPath; }
@@ -261,7 +473,9 @@ namespace dylib {
 				bool						explicitlyLinked() const	{ return _explicitlyLinked; }
 				void						setImplicitlyLinked()		{ _implicitlyLinked = true; }
 				bool						implicitlyLinked() const	{ return _implicitlyLinked; }
-				
+				void						setSpeculativelyLoaded()	{ _speculativelyLoaded = true; }
+				bool						speculativelyLoaded() const	{ return _speculativelyLoaded; }
+
 				// attributes of how dylib will be used when linked
 				void						setWillBeLazyLoadedDylb()		{ _lazyLoadedDylib = true; }
 				bool						willBeLazyLoadedDylib() const	{ return _lazyLoadedDylib; }
@@ -279,13 +493,16 @@ namespace dylib {
 		virtual bool						providedExportAtom() const = 0;
 		virtual const char*					parentUmbrella() const = 0;
 		virtual const std::vector<const char*>*	allowableClients() const = 0;
+		virtual const std::vector<const char*>&	rpaths() const = 0;
 		virtual bool						hasWeakExternals() const = 0;
 		virtual bool						deadStrippable() const = 0;
 		virtual bool						hasWeakDefinition(const char* name) const = 0;
+		virtual bool						hasDefinition(const char* name) const = 0;
 		virtual bool						hasPublicInstallName() const = 0;
 		virtual bool						allSymbolsAreWeakImported() const = 0;
 		virtual bool						installPathVersionSpecific() const { return false; }
 		virtual bool						appExtensionSafe() const = 0;
+		virtual void						forEachExportedSymbol(void (^handler)(const char* symbolName, bool weakDef)) const = 0;
 
 	public:
 		const char*							_dylibInstallPath;
@@ -295,6 +512,7 @@ namespace dylib {
 		uint32_t							_dylibCompatibilityVersion;
 		bool								_explicitlyLinked;
 		bool								_implicitlyLinked;
+		bool								_speculativelyLoaded;
 		bool								_lazyLoadedDylib;
 		bool								_forcedWeakLinked;
 		bool								_reExported;
@@ -333,9 +551,9 @@ public:
 				typeCFI, typeLSDA, typeDtraceDOF, typeUnwindInfo, typeObjCClassRefs, typeObjC2CategoryList,
 				typeZeroFill, typeTentativeDefs, typeLazyPointer, typeStub, typeNonLazyPointer, typeDyldInfo, 
 				typeLazyDylibPointer, typeStubHelper, typeInitializerPointers, typeTerminatorPointers,
-				typeStubClose, typeLazyPointerClose, typeAbsoluteSymbols, 
+				typeStubClose, typeLazyPointerClose, typeAbsoluteSymbols, typeThreadStarts, typeChainStarts,
 				typeTLVDefs, typeTLVZeroFill, typeTLVInitialValues, typeTLVInitializerPointers, typeTLVPointers,
-				typeFirstSection, typeLastSection, typeDebug, typeSectCreate };
+				typeFirstSection, typeLastSection, typeDebug, typeSectCreate, typeInitOffsets };
 
 
 					Section(const char* sgName, const char* sctName,
@@ -480,13 +698,37 @@ struct Fixup
 					kindStoreTargetAddressARM64TLVPLoadNowLeaPage21,	// kindSetTargetAddress + kindStoreARM64TLVPLoadNowLeaPage21
 					kindStoreTargetAddressARM64TLVPLoadNowLeaPageOff12,	// kindSetTargetAddress + kindStoreARM64TLVPLoadNowLeaPageOff12
 #endif
+#if SUPPORT_ARCH_arm64e
+					kindStoreLittleEndianAuth64,
+					kindStoreTargetAddressLittleEndianAuth64,	// kindSetTargetAddress + kindStoreLittleEndianAuth64
+					kindSetAuthData,
+#endif
 			};
+
+#if SUPPORT_ARCH_arm64e
+	struct AuthData {
+		// clang encodes the combination of the key bits as these values.
+		typedef enum {
+			ptrauth_key_asia = 0,
+			ptrauth_key_asib = 1,
+			ptrauth_key_asda = 2,
+			ptrauth_key_asdb = 3,
+		} ptrauth_key;
+
+		uint16_t discriminator;
+		bool hasAddressDiversity;
+		ptrauth_key key;
+	};
+#endif
 
 	union {
 		const Atom*	target;
 		const char*	name;
 		uint64_t	addend;
 		uint32_t	bindingIndex;
+#if SUPPORT_ARCH_arm64e
+		AuthData	authData;
+#endif
 	} u;
 	uint32_t		offsetInAtom;
 	Kind			kind : 8;
@@ -543,6 +785,14 @@ struct Fixup
 		binding(Fixup::bindingNone),  
 		contentAddendOnly(false), contentDetlaToAddendOnly(false), contentIgnoresAddend(false) 
 			{ u.addend = addend; }
+		
+#if SUPPORT_ARCH_arm64e
+	Fixup(uint32_t off, Cluster c, Kind k, AuthData authData) :
+		offsetInAtom(off), kind(k), clusterSize(c), weakImport(false), 
+		binding(Fixup::bindingNone),  
+		contentAddendOnly(false), contentDetlaToAddendOnly(false), contentIgnoresAddend(false) 
+			{ u.authData = authData; }
+#endif
 			
 	Fixup(Kind k, uint32_t lohKind, uint32_t off1, uint32_t off2) :
 		offsetInAtom(off1), kind(k), clusterSize(k1of1),  
@@ -581,6 +831,146 @@ struct Fixup
 			case k4of4:
 			case k5of5:
 				return true;
+			default:
+				break;
+		}
+		return false;
+	}
+
+	bool isStore() const {
+		switch ( kind ) {
+			case ld::Fixup::kindNone:
+			case ld::Fixup::kindNoneFollowOn:
+			case ld::Fixup::kindNoneGroupSubordinate:
+			case ld::Fixup::kindNoneGroupSubordinateFDE:
+			case ld::Fixup::kindNoneGroupSubordinateLSDA:
+			case ld::Fixup::kindNoneGroupSubordinatePersonality:
+			case ld::Fixup::kindSetTargetAddress:
+			case ld::Fixup::kindSubtractTargetAddress:
+			case ld::Fixup::kindAddAddend:
+			case ld::Fixup::kindSubtractAddend:
+			case ld::Fixup::kindSetTargetImageOffset:
+			case ld::Fixup::kindSetTargetSectionOffset:
+#if SUPPORT_ARCH_arm64e
+			case ld::Fixup::kindSetAuthData:
+#endif
+				return false;
+			default:
+				break;
+		}
+		return true;
+	}
+
+
+	bool setsTarget(bool isObjectFile) const {
+		switch ( kind ) {
+			case ld::Fixup::kindSetTargetAddress:
+			case ld::Fixup::kindLazyTarget:
+			case ld::Fixup::kindStoreTargetAddressLittleEndian32:
+			case ld::Fixup::kindStoreTargetAddressLittleEndian64:
+#if SUPPORT_ARCH_arm64e
+			case ld::Fixup::kindStoreTargetAddressLittleEndianAuth64:
+#endif
+			case ld::Fixup::kindStoreTargetAddressBigEndian32:
+			case ld::Fixup::kindStoreTargetAddressBigEndian64:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32:
+			case ld::Fixup::kindStoreTargetAddressX86BranchPCRel32:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32GOTLoad:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32GOTLoadNowLEA:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32TLVLoad:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32TLVLoadNowLEA:
+			case ld::Fixup::kindStoreTargetAddressX86Abs32TLVLoad:
+			case ld::Fixup::kindStoreTargetAddressARMBranch24:
+			case ld::Fixup::kindStoreTargetAddressThumbBranch22:
+			case ld::Fixup::kindStoreTargetAddressARMLoad12:
+#if SUPPORT_ARCH_arm64
+			case ld::Fixup::kindStoreTargetAddressARM64Branch26:
+			case ld::Fixup::kindStoreTargetAddressARM64Page21:
+			case ld::Fixup::kindStoreTargetAddressARM64PageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLoadPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLoadPageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLeaPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLeaPageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadPageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadNowLeaPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadNowLeaPageOff12:
+#endif
+				return true;
+			case ld::Fixup::kindStoreX86DtraceCallSiteNop:
+			case ld::Fixup::kindStoreX86DtraceIsEnableSiteClear:
+			case ld::Fixup::kindStoreARMDtraceCallSiteNop:
+			case ld::Fixup::kindStoreARMDtraceIsEnableSiteClear:
+			case ld::Fixup::kindStoreARM64DtraceCallSiteNop:
+			case ld::Fixup::kindStoreARM64DtraceIsEnableSiteClear:
+			case ld::Fixup::kindStoreThumbDtraceCallSiteNop:
+			case ld::Fixup::kindStoreThumbDtraceIsEnableSiteClear:
+				return isObjectFile;
+			default:
+				break;
+		}
+		return false;
+	}
+
+	bool isPcRelStore(bool isKextBundle) const {
+		switch ( kind ) {
+			case ld::Fixup::kindStoreX86BranchPCRel8:
+			case ld::Fixup::kindStoreX86BranchPCRel32:
+			case ld::Fixup::kindStoreX86PCRel8:
+			case ld::Fixup::kindStoreX86PCRel16:
+			case ld::Fixup::kindStoreX86PCRel32:
+			case ld::Fixup::kindStoreX86PCRel32_1:
+			case ld::Fixup::kindStoreX86PCRel32_2:
+			case ld::Fixup::kindStoreX86PCRel32_4:
+			case ld::Fixup::kindStoreX86PCRel32GOTLoad:
+			case ld::Fixup::kindStoreX86PCRel32GOTLoadNowLEA:
+			case ld::Fixup::kindStoreX86PCRel32GOT:
+			case ld::Fixup::kindStoreX86PCRel32TLVLoad:
+			case ld::Fixup::kindStoreX86PCRel32TLVLoadNowLEA:
+			case ld::Fixup::kindStoreARMBranch24:
+			case ld::Fixup::kindStoreThumbBranch22:
+			case ld::Fixup::kindStoreARMLoad12:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32GOTLoad:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32GOTLoadNowLEA:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32TLVLoad:
+			case ld::Fixup::kindStoreTargetAddressX86PCRel32TLVLoadNowLEA:
+			case ld::Fixup::kindStoreTargetAddressARMBranch24:
+			case ld::Fixup::kindStoreTargetAddressThumbBranch22:
+			case ld::Fixup::kindStoreTargetAddressARMLoad12:
+#if SUPPORT_ARCH_arm64
+			case ld::Fixup::kindStoreARM64Page21:
+			case ld::Fixup::kindStoreARM64PageOff12:
+			case ld::Fixup::kindStoreARM64GOTLoadPage21:
+			case ld::Fixup::kindStoreARM64GOTLoadPageOff12:
+			case ld::Fixup::kindStoreARM64GOTLeaPage21:
+			case ld::Fixup::kindStoreARM64GOTLeaPageOff12:
+			case ld::Fixup::kindStoreARM64TLVPLoadPage21:
+			case ld::Fixup::kindStoreARM64TLVPLoadPageOff12:
+			case ld::Fixup::kindStoreARM64TLVPLoadNowLeaPage21:
+			case ld::Fixup::kindStoreARM64TLVPLoadNowLeaPageOff12:
+			case ld::Fixup::kindStoreARM64PCRelToGOT:
+			case ld::Fixup::kindStoreTargetAddressARM64Page21:
+			case ld::Fixup::kindStoreTargetAddressARM64PageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLoadPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLoadPageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLeaPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64GOTLeaPageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadPageOff12:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadNowLeaPage21:
+			case ld::Fixup::kindStoreTargetAddressARM64TLVPLoadNowLeaPageOff12:
+#endif
+				return true;
+			case ld::Fixup::kindStoreTargetAddressX86BranchPCRel32:
+#if SUPPORT_ARCH_arm64
+			case ld::Fixup::kindStoreTargetAddressARM64Branch26:
+#endif
+				return !isKextBundle;
+#if SUPPORT_ARCH_arm64
+			case ld::Fixup::kindStoreARM64Branch26:
+#endif
+				return !isKextBundle;
 			default:
 				break;
 		}
@@ -685,14 +1075,14 @@ public:
 	};
  
 											Atom(const Section& sect, Definition d, Combine c, Scope s, ContentType ct, 
-												SymbolTableInclusion i, bool dds, bool thumb, bool al, Alignment a) :  
+												SymbolTableInclusion i, bool dds, bool thumb, bool al, Alignment a, bool cold=false) :
 													_section(&sect), _address(0), _alignmentModulus(a.modulus), 
 													_alignmentPowerOf2(a.powerOf2), _definition(d), _combine(c),   
 													_dontDeadStrip(dds), _thumb(thumb), _alias(al), _autoHide(false), 
 													_contentType(ct), _symbolTableInclusion(i),
 													_scope(s), _mode(modeSectionOffset), 
 													_overridesADylibsWeakDef(false), _coalescedAway(false),
-													_live(false), _dontDeadStripIfRefLive(false),
+													_live(false), _dontDeadStripIfRefLive(false), _cold(cold),
 													_machoSection(0), _weakImportState(weakImportUnset)
 													 {
 													#ifndef NDEBUG
@@ -726,6 +1116,7 @@ public:
 	bool									weakImported() const		{ return _weakImportState == weakImportTrue; }
 	WeakImportState							weakImportState() const		{ return _weakImportState; }
 	bool									autoHide() const			{ return _autoHide; }
+	bool									cold() const			    { return _cold; }
 	bool									live() const				{ return _live; }
 	uint8_t									machoSection() const		{ assert(_machoSection != 0); return _machoSection; }
 
@@ -745,10 +1136,12 @@ public:
 	void									setSectionStartAddress(uint64_t a) { assert(_mode == modeSectionOffset); _address += a; _mode = modeFinalAddress; }
 	uint64_t								sectionOffset() const		{ assert(_mode == modeSectionOffset); return _address; }
 	uint64_t								finalAddress() const		{ assert(_mode == modeFinalAddress); return _address; }
-#ifndef NDEBUG
 	bool									finalAddressMode() const    { return (_mode == modeFinalAddress); }
-#endif
+
 	virtual const File*						file() const = 0;
+	// Return the original file this atom belongs to, for instance for an LTO atom,
+	// file() would return the LTO MachO file instead of the original bitcode file.
+	virtual const ld::File*				    originalFile() const       { return file(); }
 	virtual const char*						translationUnitSource() const { return NULL; }
 	virtual const char*						name() const = 0;
 	virtual uint64_t						objectAddress() const = 0;
@@ -779,7 +1172,10 @@ public:
 													_definition = a._definition;
 													_combine = a._combine;
 													_dontDeadStrip = a._dontDeadStrip;
+													_dontDeadStripIfRefLive = a._dontDeadStripIfRefLive;
+													_cold = a._cold;
 													_thumb = a._thumb;
+													_alias = a._alias;
 													_autoHide = a._autoHide;
 													_contentType = a._contentType;
 													_symbolTableInclusion = a._symbolTableInclusion;
@@ -789,6 +1185,14 @@ public:
 													_coalescedAway = a._coalescedAway;
 													_weakImportState = a._weakImportState;
 												}
+
+	const char*								safeFilePath() const {
+												const File* f = this->file();
+												if ( f != NULL )
+													return f->path();
+												else
+													return "<internal>";
+											}
 
 protected:
 	enum AddressMode { modeSectionOffset, modeFinalAddress };
@@ -811,6 +1215,7 @@ protected:
 	bool								_coalescedAway : 1;
 	bool								_live : 1;
 	bool								_dontDeadStripIfRefLive : 1;
+	bool								_cold : 1;
 	unsigned							_machoSection : 8;
 	WeakImportState						_weakImportState : 2;
 };
@@ -818,13 +1223,14 @@ protected:
 
 class IndirectBindingTable
 {
-public:	
+public:
+	virtual 					~IndirectBindingTable() { }
 	virtual const char*			indirectName(uint32_t bindingIndex) const = 0;
 	virtual const ld::Atom*		indirectAtom(uint32_t bindingIndex) const = 0;
 };
 
 
-	
+
 // utility classes for using std::unordered_map with c-strings
 struct CStringHash {
 	size_t operator()(const char* __s) const {
@@ -876,49 +1282,59 @@ public:
 										Internal() : bundleLoader(NULL),
 											entryPoint(NULL), classicBindingHelper(NULL),
 											lazyBindingHelper(NULL), compressedFastBinderProxy(NULL),
-											objcObjectConstraint(ld::File::objcConstraintNone), 
-											objcDylibConstraint(ld::File::objcConstraintNone), 
-											swiftVersion(0), cpuSubType(0), minOSVersion(0),
+											hasObjC(false),
+											swiftVersion(0), swiftLanguageVersion(0),
+											cpuSubType(0), minOSVersion(0),
 											objectFileFoundWithNoVersion(false),
 											allObjectFilesScatterable(true), 
 											someObjectFileHasDwarf(false), usingHugeSections(false),
+											someObjectFileHasSwift(false), firstSwiftDylibFile(nullptr),
 											hasThreadLocalVariableDefinitions(false),
 											hasWeakExternalSymbols(false),
 											someObjectHasOptimizationHints(false),
-											dropAllBitcode(false), embedMarkerOnly(false)	{ }
+											dropAllBitcode(false), embedMarkerOnly(false),
+											forceLoadCompilerRT(false)	{ }
 
 	std::vector<FinalSection*>					sections;
 	std::vector<ld::dylib::File*>				dylibs;
+	std::vector<std::string>					archivePaths;
 	std::vector<ld::relocatable::File::Stab>	stabs;
 	AtomToSection								atomToSection;		
+	CStringSet									unprocessedLinkerOptionLibraries;
+	CStringSet									unprocessedLinkerOptionFrameworks;
 	CStringSet									linkerOptionLibraries;
 	CStringSet									linkerOptionFrameworks;
-	CStringSet									linkerOptionLibrariesProcessed;
-	CStringSet									linkerOptionFrameworksProcessed;
+	CStringSet									missingLinkerOptionLibraries;
+	CStringSet									missingLinkerOptionFrameworks;
 	std::vector<const ld::Atom*>				indirectBindingTable;
 	std::vector<const ld::relocatable::File*>	filesWithBitcode;
+	std::vector<const ld::relocatable::File*>	filesFromCompilerRT;
+	std::vector<const ld::Atom*>				deadAtoms;
 	std::unordered_set<const char*>				allUndefProxies;
+	std::unordered_set<uint64_t>				toolsVersions;
 	const ld::dylib::File*						bundleLoader;
 	const Atom*									entryPoint;
 	const Atom*									classicBindingHelper;
 	const Atom*									lazyBindingHelper;
 	const Atom*									compressedFastBinderProxy;
-	ld::File::ObjcConstraint					objcObjectConstraint;
-	ld::File::ObjcConstraint					objcDylibConstraint;
+	bool										hasObjC;
 	uint8_t										swiftVersion;
+	uint16_t									swiftLanguageVersion;
 	uint32_t									cpuSubType;
 	uint32_t									minOSVersion;
-	uint32_t									derivedPlatformLoadCommand;
 	bool										objectFileFoundWithNoVersion;
 	bool										allObjectFilesScatterable;
 	bool										someObjectFileHasDwarf;
 	bool										usingHugeSections;
+	bool										someObjectFileHasSwift;
+	const ld::dylib::File*						firstSwiftDylibFile;
 	bool										hasThreadLocalVariableDefinitions;
 	bool										hasWeakExternalSymbols;
 	bool										someObjectHasOptimizationHints;
 	bool										dropAllBitcode;
 	bool										embedMarkerOnly;
-	std::string									ltoBitcodePath;
+	bool										forceLoadCompilerRT;
+	std::vector<std::string>					ltoBitcodePath;
 };
 
 

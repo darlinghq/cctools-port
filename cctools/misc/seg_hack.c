@@ -113,7 +113,7 @@ char **envp)
 	if(stat(input, &stat_buf) == -1)
 	    system_error("can't stat input file: %s", input);
 	writeout(archs, narchs, output, stat_buf.st_mode & 0777,
-		     TRUE, FALSE, FALSE, NULL);
+		     TRUE, FALSE, FALSE, FALSE, NULL);
 
 	if(errors)
 	    return(EXIT_FAILURE);
@@ -196,7 +196,7 @@ uint32_t narchs)
 		    archs[i].members[j].offset = offset;
 		    size = 0;
 		    if(archs[i].members[j].member_long_name == TRUE){
-			size = rnd(archs[i].members[j].member_name_size,
+			size = rnd32(archs[i].members[j].member_name_size,
 				     sizeof(long));
 			archs[i].toc_long_name = TRUE;
 		    }

@@ -2,6 +2,8 @@ noinst_LTLIBRARIES = libstuff.la
 
 libstuff_la_CFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/include/foreign -D__DARWIN_UNIX03 $(WARNINGS) $(LTO_DEF) -DPROGRAM_PREFIX="\"$(PROGRAM_PREFIX)\"" $(ENDIAN_FLAG)
 
+libstuff_la_LDFLAGS = $(FTS_LIB)
+
 libstuff_la_SOURCES =  \
 	allocate.c  \
 	apple_version.c  \
@@ -41,5 +43,8 @@ libstuff_la_SOURCES =  \
 	unix_standard_mode.c  \
 	version_number.c  \
 	writeout.c \
-	coff_bytesex.c
+	write64.c \
+	coff_bytesex.c \
+	args.c
+
 

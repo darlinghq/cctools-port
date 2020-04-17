@@ -49,6 +49,7 @@
 #include <ctype.h>
 #include <libc.h>
 #ifndef __OPENSTEP__
+#include <time.h>
 #include <utime.h>
 #endif
 #include <sys/file.h>
@@ -62,6 +63,15 @@
 #include "stuff/errors.h"
 #include "stuff/allocate.h"
 #include "stuff/lto.h"
+#include "stuff/write64.h"
+#include "stuff/rnd.h"
+#include <math.h>
+
+/* cctools-port start */
+#ifndef HAVE_UTIMENS
+int utimens(const char *path, const struct timespec times[2]);
+#endif
+/* cctools-port end */
 
 /* The maximum section alignment allowed to be specified, as a power of two */
 #define MAXSECTALIGN		15 /* 2**15 or 0x8000 */
@@ -79,7 +89,9 @@ struct input_file {
     struct arch_flag arch_flag;
     struct fat_header *fat_header;
     struct fat_arch *fat_arches;
+    struct fat_arch_64 *fat_arches64;
     enum bool is_thin;
+    uint32_t raw_nfat_arch;
 };
 static struct input_file *input_files = NULL;
 static uint32_t ninput_files = 0;
@@ -88,7 +100,11 @@ static uint32_t ninput_files = 0;
 struct thin_file {
     char *name;
     char *addr;
-    struct fat_arch fat_arch;
+    cpu_type_t cputype;
+    cpu_subtype_t cpusubtype;
+    uint64_t offset;
+    uint64_t size;
+    uint32_t align;
     enum bool from_fat;
     enum bool extract;
     enum bool remove;
@@ -101,7 +117,8 @@ static uint32_t nthin_files = 0;
 static char *output_file = NULL;
 static uint32_t output_filemode = 0;
 #ifndef __OPENSTEP__
-static struct utimbuf output_timep = { 0 };
+static struct timespec output_times[2] = { 0 };
+static struct timeval output_timev[2] = { 0 };
 #else
 static time_t output_timep[2] = { 0 };
 #endif
@@ -111,6 +128,7 @@ static enum bool archives_in_input = FALSE;
 static enum bool create_flag = FALSE;
 static enum bool info_flag = FALSE;
 static enum bool detailed_info_flag = FALSE;
+static enum bool brief_info_flag = FALSE; // -archs
 
 static enum bool thin_flag = FALSE;
 static struct arch_flag thin_arch_flag = { 0 };
@@ -143,17 +161,13 @@ static enum bool arch_blank_flag = FALSE;
 
 static struct fat_header fat_header = { 0 };
 
-static struct fat_arch *arm64_fat_arch = NULL;
-static struct fat_arch *get_arm64_fat_arch(
-    void);
-
-static struct fat_arch *x86_64h_fat_arch = NULL;
-static struct fat_arch *get_x86_64h_fat_arch(
-    void);
-
 static enum bool verify_flag = FALSE;
 static struct arch_flag *verify_archs = NULL;
 static uint32_t nverify_archs = 0;
+
+static enum bool fat64_flag = FALSE;
+
+static enum bool hideARM64_flag = FALSE;
 
 static void create_fat(
     void);
@@ -164,30 +178,34 @@ static void process_replace_file(
 static void check_archive(
     char *name,
     char *addr,
-    uint32_t size,
+    uint64_t size,
     cpu_type_t *cputype,
     cpu_subtype_t *cpusubtype);
 static void check_extend_format_1(
     char *name,
     struct ar_hdr *ar_hdr,
-    uint32_t size_left,
+    uint64_t size_left,
     uint32_t *member_name_size);
+static uint32_t get_mh_filetype(
+    char* addr,
+    uint64_t size);
 static uint32_t get_align(
     struct mach_header *mhp,
     struct load_command *load_commands,
-    uint32_t size,
+    uint64_t size,
     char *name,
     enum bool swapped);
 static uint32_t get_align_64(
     struct mach_header_64 *mhp64,
     struct load_command *load_commands,
-    uint32_t size,
+    uint64_t size,
     char *name,
     enum bool swapped);
 static uint32_t guess_align(
-    uint32_t vmaddr);
+    uint64_t vmaddr);
 static void print_arch(
-    struct fat_arch *fat_arch);
+    cpu_type_t cputype,
+    cpu_subtype_t cpusubtype);
 static void print_cputype(
     cpu_type_t cputype,
     cpu_subtype_t cpusubtype);
@@ -207,9 +225,6 @@ static struct segalign *new_segalign(
 static int cmp_qsort(
     const struct thin_file *thin1,
     const struct thin_file *thin2);
-static uint32_t rnd(
-    uint32_t v,
-    uint32_t r);
 static enum bool ispoweroftwo(
     uint32_t x);
 static void check_arch(
@@ -240,6 +255,7 @@ char *envp[])
     const struct arch_flag *arch_flags;
     enum bool found;
     struct arch_flag blank_arch;
+    int time_result;
 
 	input = NULL;
 	/*
@@ -284,6 +300,9 @@ char *envp[])
 			new_blank_dylib(&blank_arch);
 			a += 1;
 		    }
+		    else if(strcmp(p, "archs") == 0){
+			brief_info_flag = TRUE;
+		    }
 		    else
 			goto unknown_flag;
 		    break;
@@ -326,6 +345,13 @@ char *envp[])
 		    else
 			goto unknown_flag;
 		    break;
+                case 'h':
+                    if (strcmp(p, "hideARM64") == 0) {
+                        hideARM64_flag = TRUE;
+                    }
+                    else
+                        goto unknown_flag;
+                    break;
 		case 'i':
 		    if(strcmp(p, "info") == 0 || strcmp(p, "i") == 0){
 			info_flag = TRUE;
@@ -401,7 +427,7 @@ char *envp[])
 			    arch_usage();
 			    usage();
 			}
-			value = strtoul(argv[a+2], &endp, 16);
+			value = (uint32_t)strtoul(argv[a+2], &endp, 16);
 			if(*endp != '\0')
 			    fatal("argument for -segalign <arch_type> %s not a "
 				  "proper hexadecimal number", argv[a+2]);
@@ -468,6 +494,12 @@ char *envp[])
 		    else
 			goto unknown_flag;
 		    break;
+		case 'f':
+		    if(strcmp(p, "fat64") == 0)
+			fat64_flag = TRUE;
+		    else
+			goto unknown_flag;
+		    break;
 		default:
 unknown_flag:
 		    fatal("unknown flag: %s", argv[a]);
@@ -483,13 +515,14 @@ unknown_flag:
 	 * Check to see the specified arguments are valid.
 	 */
 	if(info_flag == FALSE && detailed_info_flag == FALSE &&
+	   brief_info_flag == FALSE &&
 	   create_flag == FALSE && thin_flag == FALSE &&
 	   extract_flag == FALSE && remove_flag == FALSE &&
 	   replace_flag == FALSE && verify_flag == FALSE){
 	    error("one of -create, -thin <arch_type>, -extract <arch_type>, "
 		  "-remove <arch_type>, -replace <arch_type> <file_name>, "
 		  "-verify_arch <arch_type> ... , "
-		  "-info or -detailed_info must be specified");
+		  "-archs, -info, or -detailed_info must be specified");
 	    usage();
 	}
 	if((create_flag == TRUE || thin_flag == TRUE || extract_flag == TRUE ||
@@ -506,18 +539,28 @@ unknown_flag:
 	    error("only one input file allowed with -verify_arch");
 	    usage();
 	}
+	if(brief_info_flag == TRUE && ninput_files != 1){
+	    error("only one input file allowed with -archs");
+	    usage();
+	}
 	if(create_flag + thin_flag + extract_flag + remove_flag + replace_flag +
-	   info_flag + detailed_info_flag + verify_flag > 1){
+	   info_flag + detailed_info_flag + brief_info_flag + verify_flag > 1){
 	    error("only one of -create, -thin <arch_type>, -extract <arch_type>"
 		  ", -remove <arch_type>, -replace <arch_type> <file_name>, "
 		  "-verify_arch <arch_type> ..., "
-		  "-info or -detailed_info can be specified");
+		  "-info, -archs, or -detailed_info can be specified");
 	    usage();
 	}
 	if(arch_blank_flag == TRUE && create_flag == FALSE){
 		error("-arch_blank may only be used with -create");
 		usage();
 	}
+        if (hideARM64_flag == TRUE && create_flag == FALSE &&
+            replace_flag == FALSE && remove_flag == FALSE) {
+            error("-hideARM64 may only be used with -create, -remove, or "
+                  "-replace");
+            usage();
+        }
 
 	/*
 	 * Determine the types of the input files.
@@ -533,17 +576,17 @@ unknown_flag:
 	    /* check to make sure no two files have the same architectures */
 	    for(i = 0; i < nthin_files; i++)
 		for(j = i + 1; j < nthin_files; j++)
-		    if(thin_files[i].fat_arch.cputype == 
-		       thin_files[j].fat_arch.cputype && 
-		       (thin_files[i].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK)==
-		       (thin_files[j].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK)){
+		    if(thin_files[i].cputype == 
+		       thin_files[j].cputype && 
+		       (thin_files[i].cpusubtype & ~CPU_SUBTYPE_MASK)==
+		       (thin_files[j].cpusubtype & ~CPU_SUBTYPE_MASK)){
 			arch_flags = get_arch_flags();
 			for(k = 0; arch_flags[k].name != NULL; k++){
 			    if(arch_flags[k].cputype ==
-			       thin_files[j].fat_arch.cputype && 
+			       thin_files[j].cputype && 
 			       (arch_flags[k].cpusubtype &
 				~CPU_SUBTYPE_MASK) ==
-			       (thin_files[j].fat_arch.cpusubtype &
+			       (thin_files[j].cpusubtype &
 				~CPU_SUBTYPE_MASK))
 			    fatal("%s and %s have the same architectures (%s) "
 			      "and can't be in the same fat output file",
@@ -553,8 +596,8 @@ unknown_flag:
 			fatal("%s and %s have the same architectures (cputype "
 			      "(%d) and cpusubtype (%d)) and can't be in the "
 			      "same fat output file", thin_files[i].name,
-			      thin_files[j].name,thin_files[i].fat_arch.cputype,
-			      thin_files[i].fat_arch.cpusubtype &
+			      thin_files[j].name,thin_files[i].cputype,
+			      thin_files[i].cpusubtype &
 				~CPU_SUBTYPE_MASK);
 		    }
 	    create_fat();
@@ -568,8 +611,8 @@ unknown_flag:
 		fatal("input file (%s) must be a fat file when the -thin "
 		      "option is specified", input_files[0].name);
 	    for(i = 0; i < nthin_files; i++){
-		if(thin_files[i].fat_arch.cputype == thin_arch_flag.cputype &&
-		   (thin_files[i].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK) ==
+		if(thin_files[i].cputype == thin_arch_flag.cputype &&
+		   (thin_files[i].cpusubtype & ~CPU_SUBTYPE_MASK) ==
 		   (thin_arch_flag.cpusubtype & ~CPU_SUBTYPE_MASK)){
 		    (void)unlink(output_file);
 		    if((fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC,
@@ -577,18 +620,28 @@ unknown_flag:
 			system_fatal("can't create output file: %s",
 				     output_file);
 
-		    if(write(fd, thin_files[i].addr,thin_files[i].fat_arch.size)
-		       != (int)(thin_files[i].fat_arch.size))
-			system_fatal("can't write thin file to output file: %s",
-				     output_file);
+                    if (write64(fd, thin_files[i].addr, thin_files[i].size) !=
+                        thin_files[i].size)
+                        system_fatal("can't write thin file to output "
+                                     "file: %s", output_file);
 		    if(close(fd) == -1)
 			system_fatal("can't close output file: %s",output_file);
-		    if(utime(output_file,
 #ifndef __OPENSTEP__
-		       &output_timep) == -1)
-#else
-		       output_timep) == -1)
+			/* cctools-port: Replaced for portability. */
+#if 0
+		    if (__builtin_available(macOS 10.12, *)) {
+			time_result = utimensat(AT_FDCWD, output_file,
+						output_times, 0);
+		    }
+		    else {
+			time_result = utimes(output_file, output_timev);
+		    }
 #endif
+			time_result = utimens(output_file, output_times);
+#else
+		    time_result = utime(output_file, output_timep);
+#endif
+		    if (time_result == -1)
 			system_fatal("can't set the modify times for "
 				     "output file: %s", output_file);
 		    break;
@@ -607,6 +660,9 @@ unknown_flag:
 	    if(input_files[0].fat_header == NULL)
 		fatal("input file (%s) must be a fat file when the -extract "
 		      "option is specified", input_files[0].name);
+	    if(input_files[0].fat_header->magic == FAT_MAGIC_64)
+		fat64_flag = TRUE;
+
 	    for(i = 0; i < nextract_arch_flags; i++){
 		for(j = i + 1; j < nextract_arch_flags; j++){
 		if(extract_arch_flags[i].cputype ==
@@ -622,10 +678,10 @@ unknown_flag:
 		found = FALSE;
 		for(j = 0; j < nthin_files; j++){
 		    if(extract_arch_flags[i].cputype ==
-			   thin_files[j].fat_arch.cputype &&
+			   thin_files[j].cputype &&
 		       ((extract_arch_flags[i].cpusubtype &
 			 ~CPU_SUBTYPE_MASK)==
-		        (thin_files[j].fat_arch.cpusubtype &
+		        (thin_files[j].cpusubtype &
 			 ~CPU_SUBTYPE_MASK) ||
 			extract_family_flag == TRUE)){
 			thin_files[j].extract = TRUE;
@@ -657,6 +713,8 @@ unknown_flag:
 	    if(input_files[0].fat_header == NULL)
 		fatal("input file (%s) must be a fat file when the -remove "
 		      "option is specified", input_files[0].name);
+	    if(input_files[0].fat_header->magic == FAT_MAGIC_64)
+		fat64_flag = TRUE;
 	    for(i = 0; i < nremove_arch_flags; i++){
 		for(j = i + 1; j < nremove_arch_flags; j++){
 		if(remove_arch_flags[i].cputype ==
@@ -671,10 +729,10 @@ unknown_flag:
 	    for(i = 0; i < nremove_arch_flags; i++){
 		for(j = 0; j < nthin_files; j++){
 		    if(remove_arch_flags[i].cputype ==
-			   thin_files[j].fat_arch.cputype &&
+			   thin_files[j].cputype &&
 		       (remove_arch_flags[i].cpusubtype &
 			~CPU_SUBTYPE_MASK) ==
-		       (thin_files[j].fat_arch.cpusubtype &
+		       (thin_files[j].cpusubtype &
 			~CPU_SUBTYPE_MASK)){
 			thin_files[j].remove = TRUE;
 			break;
@@ -707,6 +765,8 @@ unknown_flag:
 	    if(input_files[0].fat_header == NULL)
 		fatal("input file (%s) must be a fat file when the -replace "
 		      "option is specified", input_files[0].name);
+	    if(input_files[0].fat_header->magic == FAT_MAGIC_64)
+		fat64_flag = TRUE;
 	    for(i = 0; i < nreplaces; i++){
 		for(j = i + 1; j < nreplaces; j++){
 		if(replaces[i].arch_flag.cputype ==
@@ -721,9 +781,9 @@ unknown_flag:
 		process_replace_file(replaces + i);
 		for(j = 0; j < nthin_files; j++){
 		    if(replaces[i].arch_flag.cputype ==
-			   thin_files[j].fat_arch.cputype &&
+			   thin_files[j].cputype &&
 		       (replaces[i].arch_flag.cpusubtype & ~CPU_SUBTYPE_MASK) ==
-		       (thin_files[j].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK)){
+		       (thin_files[j].cpusubtype & ~CPU_SUBTYPE_MASK)){
 			thin_files[j] = replaces[i].thin_file;
 			break;
 		    }
@@ -736,14 +796,45 @@ unknown_flag:
 	    create_fat();
 	}
 
+	if (brief_info_flag) {
+	    for (i = 0; i < nthin_files; i++) {
+		const char* s = get_arch_name_if_known(
+				    thin_files[i].cputype,
+				    thin_files[i].cpusubtype);
+		if (i) {
+		    printf(" ");
+		}
+		if (s) {
+		    printf("%s", s);
+		}
+		else {
+		    printf("unknown(%u,%u)", thin_files[i].cputype,
+			   thin_files[i].cpusubtype & ~CPU_SUBTYPE_MASK);
+		}
+	    }
+	    printf("\n");
+	}
+
 	if(info_flag){
 	    for(i = 0; i < ninput_files; i++){
 		if(input_files[i].fat_header != NULL){
 		    printf("Architectures in the fat file: %s are: ",
 			   input_files[i].name);
-		    for(j = 0; j < input_files[i].fat_header->nfat_arch; j++){
-		        print_arch(&(input_files[i].fat_arches[j]));
-			printf(" ");
+		    if(input_files[i].fat_arches != NULL){
+			for(j = 0; j < input_files[i].fat_header->nfat_arch;
+			    j++){
+			    print_arch(input_files[i].fat_arches[j].cputype,
+				input_files[i].fat_arches[j].cpusubtype);
+			    printf(" ");
+			}
+		    }
+		    else{
+			for(j = 0; j < input_files[i].fat_header->nfat_arch;
+			    j++){
+			    print_arch(input_files[i].fat_arches64[j].cputype,
+				input_files[i].fat_arches64[j].cpusubtype);
+			    printf(" ");
+			}
 		    }
 		    printf("\n");
 		}
@@ -758,8 +849,8 @@ unknown_flag:
 		    continue;
 		printf("Non-fat file: %s is architecture: %s\n",
 		       thin_files[i].name,
-		       get_arch_name_from_types(thin_files[i].fat_arch.cputype,
-			thin_files[i].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK));
+		       get_arch_name_from_types(thin_files[i].cputype,
+			thin_files[i].cpusubtype & ~CPU_SUBTYPE_MASK));
 	    }
 	}
 
@@ -769,22 +860,54 @@ unknown_flag:
 		    printf("Fat header in: %s\n", input_files[i].name);
 		    printf("fat_magic 0x%x\n",
 			  (unsigned int)(input_files[i].fat_header->magic));
-		    printf("nfat_arch %u\n",
-			   input_files[i].fat_header->nfat_arch);
+		    printf("nfat_arch %u",
+			   input_files[i].raw_nfat_arch);
+                    if (input_files[i].fat_header->nfat_arch -
+                        input_files[i].raw_nfat_arch) {
+                        printf(" (+%u hidden)",
+                               input_files[i].fat_header->nfat_arch -
+                               input_files[i].raw_nfat_arch);
+                    }
+                    printf("\n");
 		    for(j = 0; j < input_files[i].fat_header->nfat_arch; j++){
 			printf("architecture ");
-		        print_arch(&(input_files[i].fat_arches[j]));
-			printf("\n");
-			print_cputype(input_files[i].fat_arches[j].cputype,
+			if(input_files[i].fat_arches != NULL){
+			    print_arch(input_files[i].fat_arches[j].cputype,
+				       input_files[i].fat_arches[j].cpusubtype);
+                            if (j >= input_files[i].raw_nfat_arch) {
+                                printf(" (hidden)");
+                            }
+			    printf("\n");
+			    print_cputype(input_files[i].fat_arches[j].cputype,
 				      input_files[i].fat_arches[j].cpusubtype &
-				      ~CPU_SUBTYPE_MASK);
-			printf("    offset %u\n",
-			       input_files[i].fat_arches[j].offset);
-			printf("    size %u\n",
-			       input_files[i].fat_arches[j].size);
-			printf("    align 2^%u (%d)\n",
-			       input_files[i].fat_arches[j].align,
-			       1 << input_files[i].fat_arches[j].align);
+					  ~CPU_SUBTYPE_MASK);
+			    printf("    offset %u\n",
+				   input_files[i].fat_arches[j].offset);
+			    printf("    size %u\n",
+				   input_files[i].fat_arches[j].size);
+			    printf("    align 2^%u (%d)\n",
+				   input_files[i].fat_arches[j].align,
+				   1 << input_files[i].fat_arches[j].align);
+			}
+			else{
+			    print_arch(input_files[i].fat_arches64[j].cputype,
+				   input_files[i].fat_arches64[j].cpusubtype);
+                            if (j >= input_files[i].raw_nfat_arch) {
+                                printf(" (hidden)");
+                            }
+			    printf("\n");
+			    print_cputype(
+				input_files[i].fat_arches64[j].cputype,
+				input_files[i].fat_arches64[j].cpusubtype &
+					  ~CPU_SUBTYPE_MASK);
+			    printf("    offset %llu\n",
+				   input_files[i].fat_arches64[j].offset);
+			    printf("    size %llu\n",
+				   input_files[i].fat_arches64[j].size);
+			    printf("    align 2^%u (%d)\n",
+				   input_files[i].fat_arches64[j].align,
+				   1 << input_files[i].fat_arches64[j].align);
+			}
 		    }
 		}
 		else{
@@ -797,8 +920,8 @@ unknown_flag:
 		    continue;
 		printf("Non-fat file: %s is architecture: %s\n",
 		       thin_files[i].name,
-		       get_arch_name_from_types(thin_files[i].fat_arch.cputype,
-			thin_files[i].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK));
+		       get_arch_name_from_types(thin_files[i].cputype,
+			thin_files[i].cpusubtype & ~CPU_SUBTYPE_MASK));
 	    }
 	}
 
@@ -807,9 +930,9 @@ unknown_flag:
 		found = FALSE;
 		for(j = 0; j < nthin_files; j++){
 		    if(verify_archs[i].cputype == 
-		       thin_files[j].fat_arch.cputype && 
+		       thin_files[j].cputype && 
 		       (verify_archs[i].cpusubtype & ~CPU_SUBTYPE_MASK) == 
-		       (thin_files[j].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK)){
+		       (thin_files[j].cpusubtype & ~CPU_SUBTYPE_MASK)){
 			found = TRUE;
 			break;
 		    }
@@ -829,9 +952,12 @@ static
 void
 create_fat(void)
 {
-    uint32_t i, j, offset;
+    uint32_t i, j;
+    uint64_t offset;
     char *rename_file;
     int fd;
+    struct fat_arch fat_arch;
+    struct fat_arch_64 fat_arch64;
 
 	/* fold in specified segment alignments */
 	for(i = 0; i < nsegaligns; i++){
@@ -847,22 +973,22 @@ create_fat(void)
 	for(i = 0; i < nsegaligns; i++){
 	    for(j = 0; j < nthin_files; j++){
 		if(segaligns[i].arch_flag.cputype ==
-		       thin_files[j].fat_arch.cputype &&
+		       thin_files[j].cputype &&
 		   (segaligns[i].arch_flag.cpusubtype & ~CPU_SUBTYPE_MASK) ==
-		       (thin_files[j].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK)){
+		       (thin_files[j].cpusubtype & ~CPU_SUBTYPE_MASK)){
 /*
  Since this program has to guess at alignments and guesses high when unsure this
  check shouldn't be used so the the correct alignment can be specified by the
  the user.
-		    if(thin_files[j].fat_arch.align > segaligns[i].align)
+		    if(thin_files[j].align > segaligns[i].align)
 			fatal("specified segment alignment: %d for "
 			      "architecture %s is less than the alignment: %d "
 			      "required from the input file",
 			      1 << segaligns[i].align,
 			      segaligns[i].arch_flag.name,
-			      1 << thin_files[j].fat_arch.align);
+			      1 << thin_files[j].align);
 */
-		    thin_files[j].fat_arch.align = segaligns[i].align;
+		    thin_files[j].align = segaligns[i].align;
 		    break;
 		}
 	    }
@@ -875,22 +1001,60 @@ create_fat(void)
 	/* sort the files by alignment to save space in the output file */
 	qsort(thin_files, nthin_files, sizeof(struct thin_file),
 	      (int (*)(const void *, const void *))cmp_qsort);
-
-	/* We will order the ARM64 slice last. */
-	arm64_fat_arch = get_arm64_fat_arch();
-
-	/* We will order the x86_64h slice last too. */
-	x86_64h_fat_arch = get_x86_64h_fat_arch();
-
+    
 	/* Fill in the fat header and the fat_arch's offsets. */
-	fat_header.magic = FAT_MAGIC;
+	if(fat64_flag == TRUE)
+	    fat_header.magic = FAT_MAGIC_64;
+	else
+	    fat_header.magic = FAT_MAGIC;
 	fat_header.nfat_arch = nthin_files;
-	offset = sizeof(struct fat_header) +
-		 nthin_files * sizeof(struct fat_arch);
+        /* begin change for 15002326: write a hidden arm64 arch */
+        if (hideARM64_flag) {
+            enum bool has_arm32 = FALSE;
+            enum bool has_arm64 = FALSE;
+            uint32_t num_archs = 0;
+            uint32_t num_archs_arm64 = 0;
+            
+            for(i = 0; i < nthin_files; i++){
+                if (MH_EXECUTE != get_mh_filetype(thin_files[i].addr,
+                                                  thin_files[i].size)) {
+                    fatal("-hideARM64 specified but thin file %s is not of "
+                          "type MH_EXECUTE", thin_files[i].name);
+                }
+                if (has_arm64 && thin_files[i].cputype != CPU_TYPE_ARM64) {
+                    fatal("-hideARM64 specified but thin files are not in "
+                          "correct order");
+                }
+                if (thin_files[i].cputype == CPU_TYPE_ARM) {
+                    has_arm32 = TRUE;
+                }
+                if (thin_files[i].cputype == CPU_TYPE_ARM64) {
+                    has_arm64 = TRUE;
+                    num_archs_arm64 += 1;
+                }
+                num_archs += 1;
+            }
+            if (has_arm32 && has_arm64) {
+                fat_header.nfat_arch = num_archs - num_archs_arm64;
+            }
+        }
+        /* end change for 15002326 */
+	offset = sizeof(struct fat_header);
+	if(fat64_flag == TRUE)
+	    offset += nthin_files * sizeof(struct fat_arch_64);
+	else
+	    offset += nthin_files * sizeof(struct fat_arch);
 	for(i = 0; i < nthin_files; i++){
-	    offset = rnd(offset, 1 << thin_files[i].fat_arch.align);
-	    thin_files[i].fat_arch.offset = offset;
-	    offset += thin_files[i].fat_arch.size;
+	    offset = rnd(offset, 1 << thin_files[i].align);
+	    if(fat64_flag == FALSE && offset > UINT32_MAX)
+		fatal("fat file too large to be created because the offset "
+		      "field in struct fat_arch is only 32-bits and the offset "
+		      "(%llu) for %s for architecture %s exceeds that",
+		      offset, thin_files[i].name,
+		      get_arch_name_from_types(thin_files[i].cputype,
+			thin_files[i].cpusubtype & ~CPU_SUBTYPE_MASK));
+	    thin_files[i].offset = offset;
+	    offset += thin_files[i].size;
 	}
 
 	rename_file = makestr(output_file, ".lipo", NULL);
@@ -906,7 +1070,7 @@ create_fat(void)
 #ifdef __LITTLE_ENDIAN__
 	    swap_fat_header(&fat_header, BIG_ENDIAN_BYTE_SEX);
 #endif /* __LITTLE_ENDIAN__ */
-	    if(write(fd, &fat_header, sizeof(struct fat_header)) !=
+	    if(write64(fd, &fat_header, sizeof(struct fat_header)) !=
 	       sizeof(struct fat_header))
 		system_fatal("can't write fat header to output file: %s",
 			     rename_file);
@@ -914,70 +1078,48 @@ create_fat(void)
 	    swap_fat_header(&fat_header, LITTLE_ENDIAN_BYTE_SEX);
 #endif /* __LITTLE_ENDIAN__ */
 	    for(i = 0; i < nthin_files; i++){
-		/*
-		 * If we are ordering the ARM64 slice last of the fat_arch
-		 * structs, so skip it in this loop.
-		 */
-		if(arm64_fat_arch == &(thin_files[i].fat_arch))
-		    continue;
-		/*
-		 * If we are ordering the x86_64h slice last too of the fat_arch
-		 * structs, so skip it in this loop.
-		 */
-		if(x86_64h_fat_arch == &(thin_files[i].fat_arch))
-		    continue;
+		if(fat64_flag == TRUE){
+		    fat_arch64.cputype = thin_files[i].cputype;
+		    fat_arch64.cpusubtype = thin_files[i].cpusubtype;
+		    fat_arch64.offset = thin_files[i].offset;
+		    fat_arch64.size = thin_files[i].size;
+		    fat_arch64.align = thin_files[i].align;
+		}
+		else{
+		    fat_arch.cputype = thin_files[i].cputype;
+		    fat_arch.cpusubtype = thin_files[i].cpusubtype;
+		    fat_arch.offset = (uint32_t)thin_files[i].offset;
+		    fat_arch.size = (uint32_t)thin_files[i].size;
+		    fat_arch.align = thin_files[i].align;
+		}
+		if(fat64_flag == TRUE){
 #ifdef __LITTLE_ENDIAN__
-		swap_fat_arch(&(thin_files[i].fat_arch), 1,BIG_ENDIAN_BYTE_SEX);
+		    swap_fat_arch_64(&fat_arch64, 1, BIG_ENDIAN_BYTE_SEX);
 #endif /* __LITTLE_ENDIAN__ */
-		if(write(fd, &(thin_files[i].fat_arch),
-			 sizeof(struct fat_arch)) != sizeof(struct fat_arch))
-		    system_fatal("can't write fat arch to output file: %s",
-				 rename_file);
+		    if(write64(fd, &fat_arch64, sizeof(struct fat_arch_64)) !=
+		       sizeof(struct fat_arch_64))
+			system_fatal("can't write fat arch to output file: %s",
+				     rename_file);
+		}
+		else{
 #ifdef __LITTLE_ENDIAN__
-		swap_fat_arch(&(thin_files[i].fat_arch), 1,
-			      LITTLE_ENDIAN_BYTE_SEX);
+		    swap_fat_arch(&fat_arch, 1, BIG_ENDIAN_BYTE_SEX);
 #endif /* __LITTLE_ENDIAN__ */
+		    if(write64(fd, &fat_arch, sizeof(struct fat_arch)) !=
+		       sizeof(struct fat_arch))
+			system_fatal("can't write fat arch to output file: %s",
+				     rename_file);
+		}
 	    }
 	}
-	/*
-	 * We are ordering the ARM64 slice so it gets written last of the
-	 * fat_arch structs, so write it out here as it was skipped above.
-	 */
-	if(arm64_fat_arch){
-#ifdef __LITTLE_ENDIAN__
-	    swap_fat_arch(arm64_fat_arch, 1, BIG_ENDIAN_BYTE_SEX);
-#endif /* __LITTLE_ENDIAN__ */
-	    if(write(fd, arm64_fat_arch,
-		     sizeof(struct fat_arch)) != sizeof(struct fat_arch))
-		system_fatal("can't write fat arch to output file: %s",
-			     rename_file);
-#ifdef __LITTLE_ENDIAN__
-	    swap_fat_arch(arm64_fat_arch, 1, LITTLE_ENDIAN_BYTE_SEX);
-#endif /* __LITTLE_ENDIAN__ */
-	}
-	/*
-	 * We are ordering the x86_64h slice so it gets written last too of the
-	 * fat_arch structs, so write it out here as it was skipped above.
-	 */
-	if(x86_64h_fat_arch){
-#ifdef __LITTLE_ENDIAN__
-	    swap_fat_arch(x86_64h_fat_arch, 1, BIG_ENDIAN_BYTE_SEX);
-#endif /* __LITTLE_ENDIAN__ */
-	    if(write(fd, x86_64h_fat_arch,
-		     sizeof(struct fat_arch)) != sizeof(struct fat_arch))
-		system_fatal("can't write fat arch to output file: %s",
-			     rename_file);
-#ifdef __LITTLE_ENDIAN__
-	    swap_fat_arch(x86_64h_fat_arch, 1, LITTLE_ENDIAN_BYTE_SEX);
-#endif /* __LITTLE_ENDIAN__ */
-	}
+
 	for(i = 0; i < nthin_files; i++){
 	    if(extract_family_flag == FALSE || nthin_files > 1)
-		if(lseek(fd, thin_files[i].fat_arch.offset, L_SET) == -1)
+		if(lseek(fd, thin_files[i].offset, L_SET) == -1)
 		    system_fatal("can't lseek in output file: %s", rename_file);
-	    if(write(fd, thin_files[i].addr, thin_files[i].fat_arch.size)
-	       != (int)(thin_files[i].fat_arch.size))
-		system_fatal("can't write to output file: %s", rename_file);
+            if(write64(fd, thin_files[i].addr, thin_files[i].size) !=
+               thin_files[i].size)
+                system_fatal("can't write to output file: %s", rename_file);
 	}
 	if(close(fd) == -1)
 	    system_fatal("can't close output file: %s", rename_file);
@@ -998,7 +1140,8 @@ struct input_file *input)
 {
     int fd;
     struct stat stat_buf, stat_buf2;
-    uint32_t size, i, j;
+    uint32_t i, j;
+    uint64_t size;
     char *addr;
     struct thin_file *thin;
     struct mach_header *mhp, mh;
@@ -1008,6 +1151,7 @@ struct input_file *input)
     cpu_subtype_t cpusubtype;
     enum bool swapped;
     uint64_t big_size;
+    uint32_t offset, first_offset;
 
 	/* Open the input file and map it in */
 	if((fd = open(input->name, O_RDONLY)) == -1)
@@ -1017,6 +1161,41 @@ struct input_file *input)
 	size = stat_buf.st_size;
 	/* pick up set uid, set gid and sticky text bits */
 	output_filemode = stat_buf.st_mode & 07777;
+#ifndef __OPENSTEP__
+	/*
+	 * Select the first modify time
+	 */
+	/* cctools-port: Replaced for portability. */
+#if 0
+	if (__builtin_available(macOS 10.12, *)) {
+	    if (output_times[1].tv_sec == 0) {
+		memcpy(&output_times[0], &stat_buf.st_atimespec,
+		       sizeof(struct timespec));
+		memcpy(&output_times[1], &stat_buf.st_mtimespec,
+		       sizeof(struct timespec));
+	    }
+	} else {
+	    if (output_timev[1].tv_sec == 0) {
+		TIMESPEC_TO_TIMEVAL(&output_timev[0], &stat_buf.st_atimespec);
+		TIMESPEC_TO_TIMEVAL(&output_timev[1], &stat_buf.st_mtimespec);
+	    }
+	}
+#endif 
+	/* cctools-port start */
+#ifdef HAVE_STAT_ST_MTIMESPEC
+	output_times[0] = stat_buf.st_atimespec;
+	output_times[1] = stat_buf.st_mtimespec;
+#elif HAVE_STAT_ST_MTIM
+	output_times[0] = stat_buf.st_atim;
+	output_times[1] = stat_buf.st_mtim;
+#else
+	output_times[0].tv_sec = stat_buf.st_atime;
+	output_times[0].tv_nsec = 0;
+	output_times[1].tv_sec = stat_buf.st_mtime;
+	output_times[0].tv_nsec = 0;
+#endif
+	/* cctools-port end */
+#else
 	/*
 	 * Select the eariliest modify time so that if the output file
 	 * contains archives with table of contents lipo will not make them
@@ -1024,13 +1203,6 @@ struct input_file *input)
 	 * contents appear up todate if another file is combined with it that
 	 * has a date early enough.
 	 */
-#ifndef __OPENSTEP__
-	if(output_timep.modtime == 0 ||
-	   output_timep.modtime > stat_buf.st_mtime){
-	    output_timep.actime = stat_buf.st_atime;
-	    output_timep.modtime = stat_buf.st_mtime;
-	}
-#else
 	if(output_timep[1] == 0 || output_timep[1] > stat_buf.st_mtime){
 	    output_timep[0] = stat_buf.st_atime;
 	    output_timep[1] = stat_buf.st_mtime;
@@ -1062,7 +1234,7 @@ struct input_file *input)
 
 	/* Try to figure out what kind of file this is */
 
-	/* see if this file is a fat file */
+	/* see if this file is a 32-bit fat file */
 	if(size >= sizeof(struct fat_header) &&
 #ifdef __BIG_ENDIAN__
 	   *((uint32_t *)addr) == FAT_MAGIC)
@@ -1087,8 +1259,36 @@ struct input_file *input)
 	    if(big_size > size)
 		fatal("truncated or malformed fat file (fat_arch structs would "
 		      "extend past the end of the file) %s", input->name);
-	    input->fat_arches = (struct fat_arch *)(addr +
-						    sizeof(struct fat_header));
+	    input->fat_arches = (struct fat_arch *)
+				(addr + sizeof(struct fat_header));
+            /*
+	     * begin change for 15002326: look for a hidden arm64 arch
+	     *
+	     * the hidden arch(es) must reside between the existing fat_arch
+	     * list and the start of the first file. Also, the hidden arm64
+	     * arch(es) must be CPU_TYPE_ARM64, natch.
+	     */
+	    first_offset = 0xFFFFFFFF;
+	    input->raw_nfat_arch = input->fat_header->nfat_arch;
+	    for(i = 0; i < input->fat_header->nfat_arch; i++){
+		offset = input->fat_arches[i].offset;
+#ifdef __LITTLE_ENDIAN__
+		cputype = OSSwapInt32(offset);
+#endif
+		if (offset < first_offset)
+		    first_offset = offset;
+	    }
+            if (big_size + sizeof(struct fat_arch) <= size &&
+		big_size + sizeof(struct fat_arch) <= first_offset) {
+                i = input->fat_header->nfat_arch;
+                cputype = input->fat_arches[i].cputype;
+#ifdef __LITTLE_ENDIAN__
+                cputype = OSSwapInt32(cputype);
+#endif
+                if (cputype == CPU_TYPE_ARM64)
+                    input->fat_header->nfat_arch += 1;
+            }
+            /* end change for 15002326 */
 #ifdef __LITTLE_ENDIAN__
 	    swap_fat_arch(input->fat_arches, input->fat_header->nfat_arch,
 			  LITTLE_ENDIAN_BYTE_SEX);
@@ -1135,9 +1335,100 @@ struct input_file *input)
 		thin = new_thin();
 		thin->name = input->name;
 		thin->addr = addr + input->fat_arches[i].offset;
-		thin->fat_arch = input->fat_arches[i];
+		thin->cputype = input->fat_arches[i].cputype;
+		thin->cpusubtype = input->fat_arches[i].cpusubtype;
+		thin->offset = input->fat_arches[i].offset;
+		thin->size = input->fat_arches[i].size;
+		thin->align = input->fat_arches[i].align;
 		thin->from_fat = TRUE;
 		if(input->fat_arches[i].size >= SARMAG &&
+		   strncmp(thin->addr, ARMAG, SARMAG) == 0)
+		    archives_in_input = TRUE;
+	    }
+	}
+	/* see if this file is a 64-bit fat file */
+	else if(size >= sizeof(struct fat_header) &&
+#ifdef __BIG_ENDIAN__
+	   *((uint32_t *)addr) == FAT_MAGIC_64)
+#endif /* __BIG_ENDIAN__ */
+#ifdef __LITTLE_ENDIAN__
+	   *((uint32_t *)addr) == SWAP_INT(FAT_MAGIC_64))
+#endif /* __LITTLE_ENDIAN__ */
+	{
+
+	    if(input->arch_flag.name != NULL)
+		fatal("architecture specifed for fat input file: %s "
+		      "(architectures can't be specifed for fat input files)",
+		      input->name);
+
+	    input->fat_header = (struct fat_header *)addr;
+#ifdef __LITTLE_ENDIAN__
+	    swap_fat_header(input->fat_header, LITTLE_ENDIAN_BYTE_SEX);
+#endif /* __LITTLE_ENDIAN__ */
+	    big_size = input->fat_header->nfat_arch;
+	    big_size *= sizeof(struct fat_arch_64);
+	    big_size += sizeof(struct fat_header);
+	    if(big_size > size)
+		fatal("truncated or malformed fat file (fat_arch_64 structs "
+		    "would extend past the end of the file) %s", input->name);
+	    input->fat_arches64 = (struct fat_arch_64 *)
+				(addr + sizeof(struct fat_header));
+#ifdef __LITTLE_ENDIAN__
+	    swap_fat_arch_64(input->fat_arches64, input->fat_header->nfat_arch,
+			     LITTLE_ENDIAN_BYTE_SEX);
+#endif /* __LITTLE_ENDIAN__ */
+	    for(i = 0; i < input->fat_header->nfat_arch; i++){
+		if(input->fat_arches64[i].offset + input->fat_arches64[i].size >
+		   size)
+		    fatal("truncated or malformed fat file (offset plus size "
+			  "of cputype (%d) cpusubtype (%d) extends past the "
+			  "end of the file) %s", input->fat_arches64[i].cputype,
+			  input->fat_arches64[i].cpusubtype & ~CPU_SUBTYPE_MASK,
+			  input->name);
+		if(input->fat_arches64[i].align > MAXSECTALIGN)
+		    fatal("align (2^%u) too large of fat file %s (cputype (%d)"
+			  " cpusubtype (%d)) (maximum 2^%d)",
+			  input->fat_arches64[i].align, input->name,
+			  input->fat_arches64[i].cputype,
+			  input->fat_arches64[i].cpusubtype & ~CPU_SUBTYPE_MASK,
+			  MAXSECTALIGN);
+		if(input->fat_arches64[i].offset %
+		   (1 << input->fat_arches64[i].align) != 0)
+		    fatal("offset %llu of fat file %s (cputype (%d) cpusubtype "
+			  "(%d)) not aligned on its alignment (2^%u)",
+			  input->fat_arches64[i].offset, input->name,
+			  input->fat_arches64[i].cputype,
+			  input->fat_arches64[i].cpusubtype & ~CPU_SUBTYPE_MASK,
+			  input->fat_arches64[i].align);
+	    }
+	    for(i = 0; i < input->fat_header->nfat_arch; i++){
+		for(j = i + 1; j < input->fat_header->nfat_arch; j++){
+		    if(input->fat_arches64[i].cputype ==
+		         input->fat_arches64[j].cputype &&
+		       (input->fat_arches64[i].cpusubtype &
+			~CPU_SUBTYPE_MASK) ==
+		         (input->fat_arches64[j].cpusubtype &
+			  ~CPU_SUBTYPE_MASK))
+		    fatal("fat file %s contains two of the same architecture "
+			  "(cputype (%d) cpusubtype (%d))", input->name,
+			  input->fat_arches64[i].cputype,
+			  input->fat_arches64[i].cpusubtype &
+				~CPU_SUBTYPE_MASK);
+		}
+	    }
+
+	    /* create a thin file struct for each arch in the fat file */
+	    for(i = 0; i < input->fat_header->nfat_arch; i++){
+		thin = new_thin();
+		thin->name = input->name;
+		thin->addr = addr + input->fat_arches64[i].offset;
+		thin->cputype = input->fat_arches64[i].cputype;
+		thin->cpusubtype = input->fat_arches64[i].cpusubtype;
+		thin->offset = input->fat_arches64[i].offset;
+		thin->size = input->fat_arches64[i].size;
+		thin->align = input->fat_arches64[i].align;
+		thin->from_fat = TRUE;
+		if(input->fat_arches64[i].size >= SARMAG &&
 		   strncmp(thin->addr, ARMAG, SARMAG) == 0)
 		    archives_in_input = TRUE;
 	    }
@@ -1163,12 +1454,15 @@ struct input_file *input)
 	    }
 	    else
 		swapped = FALSE;
-	    thin->fat_arch.cputype = mhp->cputype;
-	    thin->fat_arch.cpusubtype = mhp->cpusubtype;
-	    thin->fat_arch.offset = 0;
-	    thin->fat_arch.size = size;
-	    thin->fat_arch.align = get_align(mhp, lcp, size, input->name,
-					     swapped);
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the size "
+		      "field in struct fat_arch is only 32-bits and the size "
+		      "(%llu) of %s exceeds that", size, input->name);
+	    thin->cputype = mhp->cputype;
+	    thin->cpusubtype = mhp->cpusubtype;
+	    thin->offset = 0;
+	    thin->size = size;
+	    thin->align = get_align(mhp, lcp, size, input->name, swapped);
 
 	    /* if the arch type is specified make sure it matches the object */
 	    if(input->arch_flag.name != NULL)
@@ -1195,12 +1489,15 @@ struct input_file *input)
 	    }
 	    else
 		swapped = FALSE;
-	    thin->fat_arch.cputype = mhp64->cputype;
-	    thin->fat_arch.cpusubtype = mhp64->cpusubtype;
-	    thin->fat_arch.offset = 0;
-	    thin->fat_arch.size = size;
-	    thin->fat_arch.align = get_align_64(mhp64, lcp, size, input->name,
-					        swapped);
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the size "
+		      "field in struct fat_arch is only 32-bits and the size "
+		      "(%llu) of %s exceeds that", size, input->name);
+	    thin->cputype = mhp64->cputype;
+	    thin->cpusubtype = mhp64->cpusubtype;
+	    thin->offset = 0;
+	    thin->size = size;
+	    thin->align = get_align_64(mhp64, lcp, size, input->name, swapped);
 
 	    /* if the arch type is specified make sure it matches the object */
 	    if(input->arch_flag.name != NULL)
@@ -1214,22 +1511,27 @@ struct input_file *input)
 
 	    /* create a thin file struct for this archive */
 	    thin = new_thin();
+	    input->is_thin = TRUE;
 	    thin->name = input->name;
 	    thin->addr = addr;
-	    thin->fat_arch.cputype = cputype;
-	    thin->fat_arch.cpusubtype = cpusubtype;
-	    thin->fat_arch.offset = 0;
-	    thin->fat_arch.size = size;
-	    if(thin->fat_arch.cputype & CPU_ARCH_ABI64)
-		thin->fat_arch.align = 3; /* 2^3, alignof(uint64_t) */
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the size "
+		      "field in struct fat_arch is only 32-bits and the size "
+		      "(%llu) of %s exceeds that", size, input->name);
+	    thin->cputype = cputype;
+	    thin->cpusubtype = cpusubtype;
+	    thin->offset = 0;
+	    thin->size = size;
+	    if(thin->cputype & CPU_ARCH_ABI64)
+		thin->align = 3; /* 2^3, alignof(uint64_t) */
 	    else
-		thin->fat_arch.align = 2; /* 2^2, alignof(uint32_t) */
+		thin->align = 2; /* 2^2, alignof(uint32_t) */
 
 	    /* if the arch type is specified make sure it matches the object */
 	    if(input->arch_flag.name != NULL){
 		if(cputype == 0){
-		    thin->fat_arch.cputype = input->arch_flag.cputype;
-		    thin->fat_arch.cpusubtype = input->arch_flag.cpusubtype;
+		    thin->cputype = input->arch_flag.cputype;
+		    thin->cpusubtype = input->arch_flag.cpusubtype;
 		}
 		else
 		    check_arch(input, thin);
@@ -1248,25 +1550,34 @@ struct input_file *input)
 		thin = new_thin();
 		thin->name = input->name;
 		thin->addr = addr;
-		thin->fat_arch.cputype = input->arch_flag.cputype;
-		thin->fat_arch.cpusubtype = input->arch_flag.cpusubtype;
-		thin->fat_arch.offset = 0;
-		thin->fat_arch.size = size;
-		thin->fat_arch.align = 0;
+		if(fat64_flag == FALSE && size > UINT32_MAX)
+		    fatal("file too large to be in a fat file because the size "
+			  "field in struct fat_arch is only 32-bits and the "
+			  "size (%llu) of %s exceeds that", size, input->name);
+		thin->cputype = input->arch_flag.cputype;
+		thin->cpusubtype = input->arch_flag.cpusubtype;
+		thin->offset = 0;
+		thin->size = size;
+		thin->align = 0;
 	    }
 	    else{
 #ifdef LTO_SUPPORT
-		if(is_llvm_bitcode_from_memory(addr, size, &input->arch_flag,
-					       NULL) != 0){
+		if(is_llvm_bitcode_from_memory(addr, (uint32_t)size,
+					       &input->arch_flag, NULL) != 0){
 		    /* create a thin file struct for it */
 		    thin = new_thin();
 		    thin->name = input->name;
 		    thin->addr = addr;
-		    thin->fat_arch.cputype = input->arch_flag.cputype;
-		    thin->fat_arch.cpusubtype = input->arch_flag.cpusubtype;
-		    thin->fat_arch.offset = 0;
-		    thin->fat_arch.size = size;
-		    thin->fat_arch.align = 0;
+		    if(fat64_flag == FALSE && size > UINT32_MAX)
+			fatal("file too large to be in a fat file because the "
+			      "size field in struct fat_arch is only 32-bits "
+			      "and the size (%llu) of %s exceeds that", size,
+			      input->name);
+		    thin->cputype = input->arch_flag.cputype;
+		    thin->cpusubtype = input->arch_flag.cpusubtype;
+		    thin->offset = 0;
+		    thin->size = size;
+		    thin->align = 0;
 		}
 		else
 #endif /* LTO_SUPPORT */
@@ -1287,7 +1598,7 @@ struct replace *replace)
 {
     int fd;
     struct stat stat_buf;
-    uint32_t size;
+    uint64_t size;
     char *addr;
     struct mach_header *mhp, mh;
     struct mach_header_64 *mhp64, mh64;
@@ -1322,7 +1633,15 @@ struct replace *replace)
 
 	/* see if this file is a fat file */
 	if(size >= sizeof(struct fat_header) &&
-	   *((uint32_t *)addr) == FAT_MAGIC){
+#ifdef __BIG_ENDIAN__
+	   (*((uint32_t *)addr) == FAT_MAGIC ||
+            *((uint32_t *)addr) == FAT_MAGIC_64))
+#endif /* __BIG_ENDIAN__ */
+#ifdef __LITTLE_ENDIAN__
+	   (*((uint32_t *)addr) == SWAP_INT(FAT_MAGIC) ||
+            *((uint32_t *)addr) == SWAP_INT(FAT_MAGIC_64)))
+#endif /* __LITTLE_ENDIAN__ */
+	{
 
 	    fatal("replacement file: %s is a fat file (must be a thin file)",
 		  replace->thin_file.name);
@@ -1345,11 +1664,16 @@ struct replace *replace)
 	    }
 	    else
 		swapped = FALSE;
-	    replace->thin_file.fat_arch.cputype = mhp->cputype;
-	    replace->thin_file.fat_arch.cpusubtype = mhp->cpusubtype;
-	    replace->thin_file.fat_arch.offset = 0;
-	    replace->thin_file.fat_arch.size = size;
-	    replace->thin_file.fat_arch.align =
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the "
+		      "size field in struct fat_arch is only 32-bits "
+		      "and the size (%llu) of %s exceeds that", size,
+		      replace->thin_file.name);
+	    replace->thin_file.cputype = mhp->cputype;
+	    replace->thin_file.cpusubtype = mhp->cpusubtype;
+	    replace->thin_file.offset = 0;
+	    replace->thin_file.size = size;
+	    replace->thin_file.align =
 		    get_align(mhp, lcp, size, replace->thin_file.name, swapped);
 	}
 	/* see if this file is Mach-O file for 64-bit architectures */
@@ -1370,11 +1694,16 @@ struct replace *replace)
 	    }
 	    else
 		swapped = FALSE;
-	    replace->thin_file.fat_arch.cputype = mhp64->cputype;
-	    replace->thin_file.fat_arch.cpusubtype = mhp64->cpusubtype;
-	    replace->thin_file.fat_arch.offset = 0;
-	    replace->thin_file.fat_arch.size = size;
-	    replace->thin_file.fat_arch.align =
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the "
+		      "size field in struct fat_arch is only 32-bits "
+		      "and the size (%llu) of %s exceeds that", size,
+		      replace->thin_file.name);
+	    replace->thin_file.cputype = mhp64->cputype;
+	    replace->thin_file.cpusubtype = mhp64->cpusubtype;
+	    replace->thin_file.offset = 0;
+	    replace->thin_file.size = size;
+	    replace->thin_file.align =
 	       get_align_64(mhp64, lcp, size, replace->thin_file.name, swapped);
 	}
 	/* see if this file is an archive file */
@@ -1383,27 +1712,36 @@ struct replace *replace)
 	    check_archive(replace->thin_file.name, addr, size,
 			  &cputype, &cpusubtype);
 
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the "
+		      "size field in struct fat_arch is only 32-bits "
+		      "and the size (%llu) of %s exceeds that", size,
+		      replace->thin_file.name);
 	    /* fill in the thin file struct for this archive */
 	    replace->thin_file.addr = addr;
-	    replace->thin_file.fat_arch.cputype = cputype;
-	    replace->thin_file.fat_arch.cpusubtype = cpusubtype;
-	    replace->thin_file.fat_arch.offset = 0;
-	    replace->thin_file.fat_arch.size = size;
-	    replace->thin_file.fat_arch.align = 2; /* 2^2, sizeof(uint32_t) */
+	    replace->thin_file.cputype = cputype;
+	    replace->thin_file.cpusubtype = cpusubtype;
+	    replace->thin_file.offset = 0;
+	    replace->thin_file.size = size;
+	    replace->thin_file.align = 2; /* 2^2, sizeof(uint32_t) */
 	}
 	else{
+	    if(fat64_flag == FALSE && size > UINT32_MAX)
+		fatal("file too large to be in a fat file because the "
+		      "size field in struct fat_arch is only 32-bits "
+		      "and the size (%llu) of %s exceeds that", size,
+		      replace->thin_file.name);
 	    /* fill in the thin file struct for it */
 	    replace->thin_file.addr = addr;
-	    replace->thin_file.fat_arch.cputype = replace->arch_flag.cputype;
-	    replace->thin_file.fat_arch.cpusubtype =
-				    replace->arch_flag.cpusubtype;
-	    replace->thin_file.fat_arch.offset = 0;
-	    replace->thin_file.fat_arch.size = size;
-	    replace->thin_file.fat_arch.align = 0;
+	    replace->thin_file.cputype = replace->arch_flag.cputype;
+	    replace->thin_file.cpusubtype = replace->arch_flag.cpusubtype;
+	    replace->thin_file.offset = 0;
+	    replace->thin_file.size = size;
+	    replace->thin_file.align = 0;
 	}
 
-	if(replace->thin_file.fat_arch.cputype != replace->arch_flag.cputype ||
-	   (replace->thin_file.fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK) !=
+	if(replace->thin_file.cputype != replace->arch_flag.cputype ||
+	   (replace->thin_file.cpusubtype & ~CPU_SUBTYPE_MASK) !=
 	   (replace->arch_flag.cpusubtype & ~CPU_SUBTYPE_MASK))
 	    fatal("specified architecture: %s for replacement file: %s does "
 		  "not match the file's architecture", replace->arch_flag.name,
@@ -1420,11 +1758,12 @@ void
 check_archive(
 char *name,
 char *addr,
-uint32_t size,
+uint64_t size,
 cpu_type_t *cputype,
 cpu_subtype_t *cpusubtype)
 {
-    uint32_t offset, magic, i, ar_name_size, ar_size;
+    uint64_t offset;
+    uint32_t magic, i, ar_name_size, ar_size;
     struct mach_header mh;
     struct mach_header_64 mh64;
     struct ar_hdr *ar_hdr;
@@ -1461,7 +1800,13 @@ cpu_subtype_t *cpusubtype)
 	    if(size + ar_name_size - offset > sizeof(uint32_t)){
 		memcpy(&magic, addr + offset + ar_name_size,
 		       sizeof(uint32_t));
-		if(magic == FAT_MAGIC)
+#ifdef __BIG_ENDIAN__
+		if(magic == FAT_MAGIC || magic == FAT_MAGIC_64)
+#endif /* __BIG_ENDIAN__ */
+#ifdef __LITTLE_ENDIAN__
+		if(magic == SWAP_INT(FAT_MAGIC) ||
+		   magic == SWAP_INT(FAT_MAGIC_64))
+#endif /* __LITTLE_ENDIAN__ */
 		    fatal("archive member %s(%.*s) is a fat file (not "
 			  "allowed in an archive)", name, (int)i, ar_name);
 		if((size - ar_name_size) - offset >=
@@ -1484,6 +1829,17 @@ cpu_subtype_t *cpusubtype)
 			      ~CPU_SUBTYPE_MASK, *cputype, (*cpusubtype) & 
 			      ~CPU_SUBTYPE_MASK);
 		    }
+		    else {
+			if (mh.cputype == CPU_TYPE_ARM &&
+			    *cpusubtype != mh.cpusubtype)
+			    fatal("archive member %s(%.*s) cputype (%d) and "
+				  "cpusubtype (%d) does not match previous "
+				  "archive members cputype (%d) and cpusubtype"
+				  " (%d) (all members must match)", name,
+				  (int)i, ar_name, mh.cputype, mh.cpusubtype &
+				  ~CPU_SUBTYPE_MASK, *cputype, (*cpusubtype) &
+				  ~CPU_SUBTYPE_MASK);
+		    }
 		}
 		else if((size - ar_name_size) - offset >=
 		    sizeof(struct mach_header_64) &&
@@ -1505,11 +1861,23 @@ cpu_subtype_t *cpusubtype)
 			      ~CPU_SUBTYPE_MASK, *cputype, (*cpusubtype) &
 			      ~CPU_SUBTYPE_MASK);
 		    }
+		    else {
+			if ((mh64.cputype == CPU_TYPE_X86_64 ||
+			     mh64.cputype == CPU_TYPE_ARM64) &&
+			    *cpusubtype != mh64.cpusubtype)
+			    fatal("archive member %s(%.*s) cputype (%d) and "
+				  "cpusubtype (%d) does not match previous "
+				  "archive members cputype (%d) and cpusubtype"
+				  " (%d) (all members must match)", name,
+				  (int)i, ar_name, mh64.cputype, mh64.cpusubtype &
+				  ~CPU_SUBTYPE_MASK, *cputype, (*cpusubtype) &
+				  ~CPU_SUBTYPE_MASK);
+		    }
 		}
 		else{
 		    if(strncmp(ar_name, SYMDEF, sizeof(SYMDEF) - 1) != 0){
 			ar_addr = addr + offset + ar_name_size;
-			ar_size = strtoul(ar_hdr->ar_size, NULL, 10);
+			ar_size = (uint32_t)strtoul(ar_hdr->ar_size, NULL, 10);
 #ifdef LTO_SUPPORT
 			if(is_llvm_bitcode_from_memory(ar_addr, ar_size,
 						       &arch_flag, NULL) != 0){
@@ -1532,7 +1900,7 @@ cpu_subtype_t *cpusubtype)
 		    }
 		}
 	    }
-	    offset += rnd(strtoul(ar_hdr->ar_size, NULL, 10),
+	    offset += rnd64(strtoul(ar_hdr->ar_size, NULL, 10),
 			    sizeof(short));
 	}
 }
@@ -1544,7 +1912,7 @@ void
 check_extend_format_1(
 char *name,
 struct ar_hdr *ar_hdr,
-uint32_t size_left,
+uint64_t size_left,
 uint32_t *member_name_size)
 {
     char *p, *endp, buf[sizeof(ar_hdr->ar_name)+1];
@@ -1559,7 +1927,7 @@ uint32_t *member_name_size)
 	    fatal("archive: %s malformed (ar_name: %.*s for archive extend "
 		  "format #1 starts with non-digit)", name,
 		  (int)sizeof(ar_hdr->ar_name), ar_hdr->ar_name);
-	ar_name_size = strtoul(p, &endp, 10);
+	ar_name_size = (uint32_t)strtoul(p, &endp, 10);
 	if(ar_name_size == UINT_MAX && errno == ERANGE)
 	    fatal("archive: %s malformed (size in ar_name: %.*s for archive "
 		  "extend format #1 overflows uint32_t)", name,
@@ -1578,73 +1946,100 @@ uint32_t *member_name_size)
 }
 
 /*
- * get_arm64_fat_arch() will return a pointer to the fat_arch struct for the
- * 64-bit arm slice in the thin_files[i] if it is present.  Else it returns
- * NULL.
+ * get_default_align() returns the default segment alignment for the specified
+ * cputype and cpusubtype, as an exponent of a power of 2; e.g., a segment
+ * alignment of 0x4000 will be described as 14. If the default alignment is not
+ * known it will return 0.
  */
 static
-struct fat_arch *
-get_arm64_fat_arch(
-void)
+uint32_t
+get_default_align(
+cpu_type_t cputype,
+cpu_subtype_t cpusubtype)
 {
-    uint32_t i;
-    struct fat_arch *arm64_fat_arch;
-
-	/*
-	 * Look for a 64-bit arm slice.
-	 */
-	arm64_fat_arch = NULL;
-	for(i = 0; i < nthin_files; i++){
-	    if(thin_files[i].fat_arch.cputype == CPU_TYPE_ARM64){
-		    arm64_fat_arch = &(thin_files[i].fat_arch);
-		    return(arm64_fat_arch);
-	    }
+    const char* arch_name = get_arch_name_from_types(cputype, cpusubtype);
+    if (arch_name != NULL) {
+	struct arch_flag arch_flag;
+	if (get_arch_from_flag((char*)arch_name, &arch_flag)) {
+	    uint32_t pagesize = get_segalign_from_flag(&arch_flag);
+	    return (uint32_t)(log2(pagesize));
 	}
-	return(NULL);
+    }
+    
+    return 0;
 }
 
 /*
- * get_x86_64h_fat_arch() will return a pointer to the fat_arch struct for the
- * x86_64h slice in the thin_files[i] if it is present.  Else it returns
- * NULL.
+ * get_mh_filetype() gets the filetype from the mach-o pointed to by addr.
+ * will return 0 if addr does not point to a struct mach_header or struct
+ * mach_header_64.
  */
-static
-struct fat_arch *
-get_x86_64h_fat_arch(
-void)
+static uint32_t get_mh_filetype(
+    char* addr,
+    uint64_t size)
 {
-    uint32_t i;
-    struct fat_arch *x86_64h_fat_arch;
-
-	/*
-	 * Look for a x86_64h slice.
-	 */
-	x86_64h_fat_arch = NULL;
-	for(i = 0; i < nthin_files; i++){
-	    if(thin_files[i].fat_arch.cputype == CPU_TYPE_X86_64 &&
-               (thin_files[i].fat_arch.cpusubtype & ~CPU_SUBTYPE_MASK) ==
-	       CPU_SUBTYPE_X86_64_H){
-		x86_64h_fat_arch = &(thin_files[i].fat_arch);
-		return(x86_64h_fat_arch);
-	    }
-	}
-	return(NULL);
+    uint32_t filetype;
+    uint32_t magic;
+    struct mach_header mh32;
+    struct mach_header_64 mh64;
+    
+    filetype = 0;
+    
+    if (size >= sizeof(magic)) {
+        magic = *(uint32_t*)(addr);
+        if (magic == MH_MAGIC || magic == MH_CIGAM) {
+            if (size >= sizeof(mh32)) {
+                memcpy(&mh32, addr, sizeof(mh32));
+                if (magic == MH_CIGAM)
+                    swap_mach_header(&mh32, get_host_byte_sex());
+                filetype = mh32.filetype;
+            }
+        }
+        else if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64) {
+            if (size >= sizeof(mh64)) {
+                memcpy(&mh64, addr, sizeof(mh64));
+                if (magic == MH_CIGAM)
+                    swap_mach_header_64(&mh64, get_host_byte_sex());
+                filetype = mh64.filetype;
+            }
+        }
+    }
+    
+    return filetype;
 }
 
 /*
- * get_align is passed a pointer to a mach header and size of the object.  It
- * returns the segment alignment the object was created with.  It guesses but
- * it is conservative.  The maximum alignment is that the link editor will allow
- * MAXSECTALIGN and the minimum is the conserative alignment for a uint32_t
- * which appears in a mach object files (2^2 worst case for all current 32-bit
- * machines).
+ * get_align() returns the segment alignment for this object, as an exponent of
+ * a power of 2; e.g., a segment alignment of 0x4000 will be described as 14.
+ * Since the actual segment alignment used by the linker is not recorded in the
+ * Mach-O file, get_align() will choose an alignment based on the file contents.
+ *
+ * If the mach_header points to a well-known cputype, get_align() will return
+ * the default segment alignment for that cputype. No attempt will be made to
+ * guess the "-segalign" flag passed into ld(1).
+ *
+ * If the cputype isn't recognized, get_align() will issue a warning (this is
+ * potentially a serious configuration error) and fall back to historical
+ * methods:
+ *
+ *   If the Mach-O is an MH_OBJECT (.o) file, get_align() will return the
+ *   largest section alignment within the first-and-only segment.
+ *
+ *   If the Mach-O is any other file type, get_align() will guess the alignment
+ *   for each segment from vmaddr, and then return the smallest such value.
+ *   Since all well-formed segments are required to be page aligned, the
+ *   resulting alignment will be legal, but there is a risk that unlucky
+ *   binaries will choose an alignment value that is larger than necessary.
+ *
+ * In either fall back method, the result of get_align() will be bounded by
+ * 2 (which is log2(sizeof(uint32_t))) and MAXSECTALIGN.
  */
 static
 uint32_t
 get_align(
 struct mach_header *mhp,
 struct load_command *load_commands,
-uint32_t size,
+uint64_t size,
 char *name,
 enum bool swapped)
 {
@@ -1653,20 +2048,19 @@ enum bool swapped)
     struct segment_command *sgp, sg;
     struct section *sp, s;
     enum byte_sex host_byte_sex;
-
+    
 	/*
-	 * Special case ppc and i386 architectures and return 12.
-	 * We know that with those architectures that the kernel and mmap only
-	 * need file offsets to be page (4096 byte) aligned.
+	 * Special case well-known architectures. We know that for these
+	 * architectures that the Darwin kernel and mmap require file offsets
+	 * to be page aligned.
 	 */
-	if(mhp->cputype == CPU_TYPE_POWERPC ||
-	   mhp->cputype == CPU_TYPE_I386)
-	    return(12);
-	/*
-	 * Special case ARM and return 14.  As it has 16k pages.
-	 */
-	if(mhp->cputype == CPU_TYPE_ARM)
-	    return(14);
+	align = get_default_align(mhp->cputype, mhp->cpusubtype);
+	if (align != 0)
+	    return align;
+    
+	warning("unknown cputype (%u) cpusubtype (%u), computing the segment "
+		"alignment from file contents.", mhp->cputype,
+		mhp->cpusubtype & ~CPU_SUBTYPE_MASK);
 
 	host_byte_sex = get_host_byte_sex();
 
@@ -1724,19 +2118,20 @@ enum bool swapped)
 }
 
 /*
- * get_align_64 is passed a pointer to a mach_header_64 and size of the object.
- * It returns the segment alignment the object was created with.  It guesses but
- * it is conservative.  The maximum alignment is that the link editor will allow
- * MAXSECTALIGN and the minimum is the conserative alignment for a long long
- * which appears in a mach object files (2^3 worst case for all 64-bit
- * machines).
+ * get_align_64() returns the segment alignment for this object, as an exponent
+ * of a power of 2; e.g., a segment alignment of 0x4000 will be described as 14.
+ * The method of determining the segment alignment is the same as get_align()
+ * above.
+ *
+ * In either fall back method, the result of get_align_64() will be bounded by
+ * 3 (which is log2(sizeof(uint64_t))) and MAXSECTALIGN.
  */
 static
 uint32_t
 get_align_64(
 struct mach_header_64 *mhp64,
 struct load_command *load_commands,
-uint32_t size,
+uint64_t size,
 char *name,
 enum bool swapped)
 {
@@ -1747,19 +2142,18 @@ enum bool swapped)
     enum byte_sex host_byte_sex;
 
 	/*
-	 * Special case ppc64 and x86_64 architectures and return 12.
-	 * We know that with those architectures that the kernel and mmap only
-	 * need file offsets to be page (4096 byte) aligned.
+	 * Special case well-known architectures. We know that for these
+	 * architectures that the Darwin kernel and mmap require file offsets
+	 * to be page aligned.
 	 */
-	if(mhp64->cputype == CPU_TYPE_POWERPC64 ||
-	   mhp64->cputype == CPU_TYPE_X86_64)
-	    return(12);
-	/*
-	 * Special case ARM64 and return 14.  As it has 16k pages.
-	 */
-	if(mhp64->cputype == CPU_TYPE_ARM64)
-	    return(14);
+	align = get_default_align(mhp64->cputype, mhp64->cpusubtype);
+	if (align != 0)
+	    return align;
 
+	warning("unknown cputype (%u) cpusubtype (%u), computing the segment "
+		"alignment from file contents.", mhp64->cputype,
+		mhp64->cpusubtype & ~CPU_SUBTYPE_MASK);
+	
 	host_byte_sex = get_host_byte_sex();
 
 	/* set worst case the link editor uses first */
@@ -1823,9 +2217,10 @@ enum bool swapped)
 static
 uint32_t
 guess_align(
-uint32_t vmaddr)
+uint64_t vmaddr)
 {
-    uint32_t align, segalign;
+    uint32_t align;
+    uint64_t segalign;
 
 	if(vmaddr == 0)
 	    return(MAXSECTALIGN);
@@ -1852,11 +2247,12 @@ uint32_t vmaddr)
 static
 void
 print_arch(
-struct fat_arch *fat_arch)
+cpu_type_t cputype,
+cpu_subtype_t cpusubtype)
 {
-	switch(fat_arch->cputype){
+	switch(cputype){
 	case CPU_TYPE_MC680x0:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_MC680x0_ALL:
 		printf("m68k");
 		break;
@@ -1871,7 +2267,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_POWERPC:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_POWERPC_ALL:
 		printf("ppc");
 		break;
@@ -1910,7 +2306,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_POWERPC64:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_POWERPC_ALL:
 		printf("ppc64");
 		break;
@@ -1922,7 +2318,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_VEO:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_VEO_1:
 		printf("veo1");
 		break;
@@ -1940,7 +2336,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_MC88000:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_MC88000_ALL:
 	    case CPU_SUBTYPE_MC88110:
 		printf("m88k");
@@ -1950,7 +2346,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_I386:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_I386_ALL:
 	    /* case CPU_SUBTYPE_386: same as above */
 		printf("i386");
@@ -1978,7 +2374,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_X86_64:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_X86_64_ALL:
 		printf("x86_64");
 		break;
@@ -1990,7 +2386,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_I860:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_I860_ALL:
 	    case CPU_SUBTYPE_I860_860:
 		printf("i860");
@@ -2000,7 +2396,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_HPPA:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_HPPA_ALL:
 	    case CPU_SUBTYPE_HPPA_7100LC:
 		printf("hppa");
@@ -2010,7 +2406,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_SPARC:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_SPARC_ALL:
 		printf("sparc");
 		break;
@@ -2019,7 +2415,7 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_ARM:
-	    switch(fat_arch->cpusubtype){
+	    switch(cpusubtype){
 	    case CPU_SUBTYPE_ARM_ALL:
 		printf("arm");
 		break;
@@ -2061,19 +2457,31 @@ struct fat_arch *fat_arch)
 	    }
 	    break;
 	case CPU_TYPE_ARM64:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_ARM64_ALL:
 		printf("arm64");
 		break;
 	    case CPU_SUBTYPE_ARM64_V8:
 		printf("arm64v8");
 		break;
+	    case CPU_SUBTYPE_ARM64E:
+		printf("arm64e");
+		break;
+	    default:
+		goto print_arch_unknown;
+	    }
+	    break;
+	case CPU_TYPE_ARM64_32:
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
+	    case CPU_SUBTYPE_ARM64_32_V8:
+		printf("arm64_32");
+		break;
 	    default:
 		goto print_arch_unknown;
 	    }
 	    break;
 	case CPU_TYPE_ANY:
-	    switch(fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK){
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
 	    case CPU_SUBTYPE_MULTIPLE:
 		printf("any");
 		break;
@@ -2089,8 +2497,8 @@ struct fat_arch *fat_arch)
 	    break;
 print_arch_unknown:
 	default:
-	    printf("(cputype (%d) cpusubtype (%d))", fat_arch->cputype,
-		   fat_arch->cpusubtype & ~CPU_SUBTYPE_MASK);
+	    printf("(cputype (%d) cpusubtype (%d))", cputype,
+		   cpusubtype & ~CPU_SUBTYPE_MASK);
 	    break;
 	}
 }
@@ -2375,6 +2783,20 @@ cpu_subtype_t cpusubtype)
 		printf("    cputype CPU_TYPE_ARM64\n"
 		       "    cpusubtype CPU_SUBTYPE_ARM64_V8\n");
 		break;
+	    case CPU_SUBTYPE_ARM64E:
+		printf("    cputype CPU_TYPE_ARM64\n"
+		       "    cpusubtype CPU_SUBTYPE_ARM64E\n");
+		break;
+	    default:
+		goto print_arch_unknown;
+	    }
+	    break;
+	case CPU_TYPE_ARM64_32:
+	    switch(cpusubtype & ~CPU_SUBTYPE_MASK){
+	    case CPU_SUBTYPE_ARM64_32_V8:
+		printf("    cputype CPU_TYPE_ARM64_32\n"
+		       "    cpusubtype CPU_SUBTYPE_ARM64_32_V8\n");
+		break;
 	    default:
 		goto print_arch_unknown;
 	    }
@@ -2521,22 +2943,18 @@ cmp_qsort(
 const struct thin_file *thin1,
 const struct thin_file *thin2)
 {
-	return(thin1->fat_arch.align - thin2->fat_arch.align);
-}
+	/* if cpu types match, sort by cpu subtype */
+	if (thin1->cputype == thin2->cputype)
+	    return thin1->cpusubtype - thin2->cpusubtype;
 
-/*
- * rnd() rounds v to a multiple of r.
- */
-static
-uint32_t
-rnd(
-uint32_t v,
-uint32_t r)
-{
-	r--;
-	v += r;
-	v &= ~(int32_t)r;
-	return(v);
+	/* force arm64-family to follow after all other slices */
+	if (thin1->cputype == CPU_TYPE_ARM64)
+	    return 1;
+	if (thin2->cputype == CPU_TYPE_ARM64)
+	    return -1;
+
+	/* sort all other cpu types by alignment */
+	return thin1->align - thin2->align;
 }
 
 /*
@@ -2570,12 +2988,12 @@ check_arch(
 struct input_file *input,
 struct thin_file *thin)
 {
-	if(input->arch_flag.cputype != thin->fat_arch.cputype)
+	if(input->arch_flag.cputype != thin->cputype)
 	    fatal("specifed architecture type (%s) for file (%s) does "
 		  "not match its cputype (%d) and cpusubtype (%d) "
 		  "(should be cputype (%d) and cpusubtype (%d))",
 		  input->arch_flag.name, input->name,
-		  thin->fat_arch.cputype, thin->fat_arch.cpusubtype &
+		  thin->cputype, thin->cpusubtype &
 		  ~CPU_SUBTYPE_MASK, input->arch_flag.cputype,
 		  input->arch_flag.cpusubtype & ~CPU_SUBTYPE_MASK);
 }
@@ -2600,14 +3018,14 @@ struct arch_flag *arch)
 	target_page_size = get_segalign_from_flag(arch);
 	file->addr = allocate(target_page_size);
 	memset(file->addr, '\0', target_page_size);
-	file->fat_arch.cputype = arch->cputype;
-	file->fat_arch.cpusubtype = arch->cpusubtype;
-	file->fat_arch.offset = 0;
-	file->fat_arch.size = target_page_size;
+	file->cputype = arch->cputype;
+	file->cpusubtype = arch->cpusubtype;
+	file->offset = 0;
+	file->size = target_page_size;
 	onebit = 1;
 	for(align = 1; (target_page_size & onebit) != onebit; align++)
 	   onebit = onebit << 1;
-	file->fat_arch.align = align;
+	file->align = align;
     
 	host_byte_sex = get_host_byte_sex();
 	target_byte_sex = get_byte_sex_from_flag(arch);
@@ -2634,17 +3052,30 @@ struct arch_flag *arch)
 }
 
 /*
- * Print the current usage line and exit (by calling fatal).
+ * Print the current usage line and exit.
  */
 static
 void
 usage(void)
 {
-	fatal("Usage: %s [input_file] ... [-arch <arch_type> input_file] ... "
-	      "[-info] [-detailed_info] [-output output_file] [-create] "
-	      "[-arch_blank <arch_type>] [-thin <arch_type>] "
-	      "[-remove <arch_type>] ... [-extract <arch_type>] ... "
-	      "[-extract_family <arch_type>] ... "
-	      "[-verify_arch <arch_type> ...] "
-	      "[-replace <arch_type> <file_name>] ...", progname);
+    fprintf(stderr,
+"usage: lipo <input_file> <command> [<options> ...]\n"
+"  command is one of:\n"
+"    -archs\n"
+"    -create [-arch_blank <arch_type>]\n"
+"    -detailed_info\n"
+"    -extract <arch_type> [-extract <arch_type> ...]\n"
+"    -extract_family <arch_type> [-extract_family <arch_type> ...]\n"
+"    -info\n"
+"    -remove <arch_type> [-remove <arch_type> ...]\n"
+"    -replace <arch_type> <file_name> [-replace <arch_type> <file_name> ...]\n"
+"    -thin <arch_type>\n"
+"    -verify_arch <arch_type> ...\n"
+"  options are one or more of:\n"
+"    -arch <arch_type> <input_file>\n"
+"    -hideARM64\n"
+"    -output <output_file>\n"
+"    -segalign <arch_type> <alignment>\n"
+            );
+    exit(EXIT_FAILURE);
 }

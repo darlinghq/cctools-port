@@ -87,7 +87,8 @@ private:
 	typedef macho_unwind_info_compressed_second_level_page_header<P> CSLP;
 
 	bool						encodingMeansUseDwarf(compact_unwind_encoding_t enc);
-	void						compressDuplicates(const std::vector<UnwindEntry>& entries, 
+	bool						encodingCannotBeMerged(compact_unwind_encoding_t enc);
+	void						compressDuplicates(const std::vector<UnwindEntry>& entries,
 													std::vector<UnwindEntry>& uniqueEntries);
 	void						makePersonalityIndexes(std::vector<UnwindEntry>& entries, 
 														std::map<const ld::Atom*, uint32_t>& personalityIndexMap);
@@ -303,10 +304,32 @@ bool UnwindInfoAtom<arm64>::encodingMeansUseDwarf(compact_unwind_encoding_t enc)
 	return ((enc & UNWIND_ARM64_MODE_MASK) == UNWIND_ARM64_MODE_DWARF);
 }
 
+
 template <>
 bool UnwindInfoAtom<arm>::encodingMeansUseDwarf(compact_unwind_encoding_t enc)
 {
 	return ((enc & UNWIND_ARM_MODE_MASK) == UNWIND_ARM_MODE_DWARF);
+}
+
+
+
+
+template <>
+bool UnwindInfoAtom<x86>::encodingCannotBeMerged(compact_unwind_encoding_t enc)
+{
+	return ((enc & UNWIND_X86_MODE_MASK) == UNWIND_X86_MODE_STACK_IND);
+}
+
+template <>
+bool UnwindInfoAtom<x86_64>::encodingCannotBeMerged(compact_unwind_encoding_t enc)
+{
+	return ((enc & UNWIND_X86_64_MODE_MASK) == UNWIND_X86_64_MODE_STACK_IND);
+}
+
+template <typename A>
+bool UnwindInfoAtom<A>::encodingCannotBeMerged(compact_unwind_encoding_t enc)
+{
+	return false;
 }
 
 
@@ -319,9 +342,10 @@ void UnwindInfoAtom<A>::compressDuplicates(const std::vector<UnwindEntry>& entri
 	for(std::vector<UnwindEntry>::const_iterator it=entries.begin(); it != entries.end(); ++it) {
 		const UnwindEntry& next = *it;
 		bool newNeedsDwarf = encodingMeansUseDwarf(next.encoding);
+		bool cannotBeMerged = encodingCannotBeMerged(next.encoding);
 		// remove entries which have same encoding and personalityPointer as last one
 		if ( newNeedsDwarf || (next.encoding != last.encoding) || (next.personalityPointer != last.personalityPointer) 
-						|| (next.lsda != NULL) || (last.lsda != NULL) ) {
+			 || cannotBeMerged	|| (next.lsda != NULL) || (last.lsda != NULL) ) {
 			uniqueEntries.push_back(next);
 		}
 		last = next;
@@ -424,6 +448,7 @@ void UnwindInfoAtom<arm64>::addCompressedAddressOffsetFixup(uint32_t offset, con
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k3of3, ld::Fixup::kindStoreLittleEndianLow24of32));
 }
 
+
 template <>
 void UnwindInfoAtom<arm>::addCompressedAddressOffsetFixup(uint32_t offset, const ld::Atom* func, const ld::Atom* fromFunc)
 {
@@ -461,6 +486,7 @@ void UnwindInfoAtom<arm64>::addCompressedEncodingFixup(uint32_t offset, const ld
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k2of2, ld::Fixup::kindStoreLittleEndianLow24of32));
 }
 
+
 template <>
 void UnwindInfoAtom<arm>::addCompressedEncodingFixup(uint32_t offset, const ld::Atom* fde)
 {
@@ -488,6 +514,7 @@ void UnwindInfoAtom<arm64>::addRegularAddressFixup(uint32_t offset, const ld::At
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k1of2, ld::Fixup::kindSetTargetImageOffset, func));
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k2of2, ld::Fixup::kindStoreLittleEndian32));
 }
+
 
 template <>
 void UnwindInfoAtom<arm>::addRegularAddressFixup(uint32_t offset, const ld::Atom* func)
@@ -517,6 +544,7 @@ void UnwindInfoAtom<arm64>::addRegularFDEOffsetFixup(uint32_t offset, const ld::
 	_fixups.push_back(ld::Fixup(offset+4, ld::Fixup::k2of2, ld::Fixup::kindStoreLittleEndianLow24of32));
 }
 
+
 template <>
 void UnwindInfoAtom<arm>::addRegularFDEOffsetFixup(uint32_t offset, const ld::Atom* fde)
 {
@@ -544,6 +572,7 @@ void UnwindInfoAtom<arm64>::addImageOffsetFixup(uint32_t offset, const ld::Atom*
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k1of2, ld::Fixup::kindSetTargetImageOffset, targ));
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k2of2, ld::Fixup::kindStoreLittleEndian32));
 }
+
 
 template <>
 void UnwindInfoAtom<arm>::addImageOffsetFixup(uint32_t offset, const ld::Atom* targ)
@@ -575,6 +604,7 @@ void UnwindInfoAtom<arm64>::addImageOffsetFixupPlusAddend(uint32_t offset, const
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k2of3, ld::Fixup::kindAddAddend, addend));
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k3of3, ld::Fixup::kindStoreLittleEndian32));
 }
+
 
 template <>
 void UnwindInfoAtom<arm>::addImageOffsetFixupPlusAddend(uint32_t offset, const ld::Atom* targ, uint32_t addend)

@@ -31,7 +31,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -57,10 +56,10 @@ namespace tool {
 class InputFiles : public ld::dylib::File::DylibHandler
 {
 public:
-								InputFiles(Options& opts, const char** archName);
+								InputFiles(Options& opts);
 
 	// implementation from ld::dylib::File::DylibHandler
-	virtual ld::dylib::File*	findDylib(const char* installPath, const char* fromPath);
+	virtual ld::dylib::File*	findDylib(const char* installPath, const ld::dylib::File* fromDylib, bool speculative);
 	
 	// iterates all atoms in initial files
 	void						forEachInitialAtom(ld::File::AtomHandler&, ld::Internal& state);
@@ -72,8 +71,8 @@ public:
 	// copy dylibs to link with in command line order
 	void						dylibs(ld::Internal& state);
 	
-	bool						inferredArch() const { return _inferredArch; }
-	
+	void						archives(ld::Internal& state);
+
 	void						addLinkerOptionLibraries(ld::Internal& state, ld::File::AtomHandler& handler);
 	void						createIndirectDylibs();
 
@@ -87,11 +86,11 @@ public:
 	
 private:
 	void						inferArchitecture(Options& opts, const char** archName);
-	const char*					fileArch(const uint8_t* p, unsigned len);
+	const char* 				extractFileInfo(const uint8_t* p, unsigned len, const char* path, ld::Platform& platform);
 	ld::File*					makeFile(const Options::FileInfo& info, bool indirectDylib);
 	ld::File*					addDylib(ld::dylib::File* f,        const Options::FileInfo& info);
 	void						logTraceInfo (const char* format, ...) const;
-	void						logDylib(ld::File*, bool indirect);
+	void						logDylib(ld::File*, bool indirect, bool speculative);
 	void						logArchive(ld::File*) const;
 	void						markExplicitlyLinkedDylibs();
 	void						checkDylibClientRestrictions(ld::dylib::File*);
@@ -108,15 +107,15 @@ private:
 	static void					parseWorkerThread(InputFiles *inputFiles);
 	void						startThread(void (*threadFunc)(InputFiles *)) const;
 
-	typedef std::unordered_map<const char*, ld::dylib::File*, CStringHash, CStringEquals>	InstallNameToDylib;
+	typedef std::map<std::string, ld::dylib::File*>	InstallNameToDylib;
 
 	const Options&				_options;
 	std::vector<ld::File*>		_inputFiles;
 	mutable std::set<class ld::File*>	_archiveFilesLogged;
+	mutable std::vector<std::string>	_archiveFilePaths;
 	InstallNameToDylib			_installPathToDylibs;
 	std::set<ld::dylib::File*>	_allDylibs;
 	ld::dylib::File*			_bundleLoader;
-	bool						_inferredArch;
     struct strcompclass {
         bool operator() (const char *a, const char *b) const { return ::strcmp(a, b) < 0; }
     };

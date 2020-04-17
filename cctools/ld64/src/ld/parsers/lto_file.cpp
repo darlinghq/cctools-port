@@ -31,14 +31,19 @@
 #include <pthread.h>
 #include <sys/param.h>
 #include <sys/fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
 #include <pthread.h> // ld64-port
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
+#include <atomic>
 #include <vector>
 #include <map>
 #include <unordered_set>
 #include <unordered_map>
+#include <iostream>
+#include <fstream>
 
 #include "MachOFileAbstraction.hpp"
 #include "Architectures.hpp"
@@ -46,15 +51,20 @@
 #include "macho_relocatable_file.h"
 #include "lto_file.h"
 
+// ld64-port: We keep this even though it has been removed upstream
+// as I am not sure if it won't break anything on all supported
+// platforms.
+
 // #defines are a work around for <rdar://problem/8760268>
 #undef __STDC_LIMIT_MACROS      // ld64-port
 #undef __STDC_CONSTANT_MACROS   // ld64-port
 #define __STDC_LIMIT_MACROS 1
 #define __STDC_CONSTANT_MACROS 1
+
 #include "llvm-c/lto.h"
 
+
 namespace lto {
-	  
 
 //
 // ld64 only tracks non-internal symbols from an llvm bitcode file.  
@@ -68,14 +78,13 @@ class InternalAtom : public ld::Atom
 public:
 												InternalAtom(class File& f);
 	// overrides of ld::Atom
-	virtual ld::File*							file() const		{ return &_file; }
-	virtual const char*							name() const		{ return "import-atom"; }
-	virtual uint64_t							size() const		{ return 0; }
-	virtual uint64_t							objectAddress() const { return 0; }
-	virtual void								copyRawContent(uint8_t buffer[]) const { }
-	virtual void								setScope(Scope)		{ }
-	virtual ld::Fixup::iterator					fixupsBegin() const	{ return &_undefs[0]; }
-	virtual ld::Fixup::iterator					fixupsEnd()	const 	{ return &_undefs[_undefs.size()]; }
+	ld::File*							file() const override		{ return &_file; }
+	const char*							name() const override		{ return "import-atom"; }
+	uint64_t							size() const override		{ return 0; }
+	uint64_t							objectAddress() const override { return 0; }
+	void								copyRawContent(uint8_t buffer[]) const override { }
+	ld::Fixup::iterator					fixupsBegin() const override	{ return &_undefs[0]; }
+	ld::Fixup::iterator					fixupsEnd()	const override 	{ return &_undefs[_undefs.size()]; }
 
 	// for adding references to symbols outside bitcode file
 	void										addReference(const char* nm)
@@ -96,24 +105,26 @@ class File : public ld::relocatable::File
 public:
 											File(const char* path, time_t mTime, ld::File::Ordinal ordinal, 
 													 const uint8_t* content, uint32_t contentLength, cpu_type_t arch);
-	virtual									~File();
+											~File() override;
 
 	// overrides of ld::File
-	virtual bool										forEachAtom(ld::File::AtomHandler&) const;
-	virtual bool										justInTimeforEachAtom(const char* name, ld::File::AtomHandler&) const 
+	bool										forEachAtom(ld::File::AtomHandler&) const override;
+	bool										justInTimeforEachAtom(const char* name, ld::File::AtomHandler&) const override
 																					{ return false; }
-	virtual uint32_t									cpuSubType() const			{ return _cpuSubType; }
+	uint32_t									cpuSubType() const override			{ return _cpuSubType; }
 	
 	// overrides of ld::relocatable::File 
-	virtual DebugInfoKind								debugInfo()	const			{ return _debugInfo; }
-	virtual const char*									debugInfoPath() const		{ return _debugInfoPath; }
-	virtual time_t										debugInfoModificationTime() const 
+	DebugInfoKind								debugInfo()	const override			{ return _debugInfo; }
+	const char*									debugInfoPath() const override		{ return _debugInfoPath; }
+	time_t										debugInfoModificationTime() const override
 																					{ return _debugInfoModTime; }
-	virtual const std::vector<ld::relocatable::File::Stab>*	stabs()	const			{ return NULL; }
-	virtual bool										canScatterAtoms() const		{ return true; }
-	virtual LinkerOptionsList*							linkerOptions() const		{ return NULL; }
-
-
+	const std::vector<ld::relocatable::File::Stab>*	stabs()	const override			{ return NULL; }
+	bool										canScatterAtoms() const override		{ return true; }
+	LinkerOptionsList*							linkerOptions() const override		{ return NULL; }
+	const ToolVersionList&						toolVersions() const override		{ return _toolVersions; }
+	bool												isThinLTO() const			{ return _isThinLTO; }
+	void												setIsThinLTO(bool ThinLTO) 	{ _isThinLTO = ThinLTO; }
+	// fixme rdar://24734472 objCConstraint() and objcHasCategoryClassProperties()
 	void												release();
 	lto_module_t										module()					{ return _module; }
 	class InternalAtom&									internalAtom()				{ return _internalAtom; }
@@ -127,11 +138,15 @@ public:
     static bool                                         sSupportsLocalContext;
     static bool                                         sHasTriedLocalContext;
     bool                                                mergeIntoGenerator(lto_code_gen_t generator, bool useSetModule);
+#if LTO_API_VERSION >= 18
+	void                                                addToThinGenerator(thinlto_code_gen_t generator, int id);
+#endif
 private:
 	friend class Atom;
 	friend class InternalAtom;
 	friend class Parser;
-	
+
+	bool									_isThinLTO;
 	cpu_type_t								_architecture;
 	class InternalAtom						_internalAtom;
 	class Atom*								_atomArray;
@@ -146,6 +161,7 @@ private:
 	ld::Fixup								_fixupToInternal;
 	ld::relocatable::File::DebugInfoKind	_debugInfo; 
 	uint32_t								_cpuSubType;
+	ToolVersionList							_toolVersions;  // unused, may some day contain version of clang the created bitcode
 };
 
 //
@@ -162,31 +178,32 @@ public:
 												ld::Atom::Definition d, ld::Atom::Combine c, ld::Atom::Alignment a, bool ah);
 
 	// overrides of ld::Atom
-	virtual ld::File*					file() const		{ return &_file; }
-	virtual const char*					translationUnitSource() const
+	const ld::File*				file() const override		{ return (_compiledAtom ? _compiledAtom->file() : &_file ); }
+	const ld::File*				originalFile() const override	{ return &_file; }
+	const char*					translationUnitSource() const override
 															{ return (_compiledAtom ? _compiledAtom->translationUnitSource() : NULL); }
-	virtual const char*					name() const		{ return _name; }
-	virtual uint64_t					size() const		{ return (_compiledAtom ? _compiledAtom->size() : 0); }
-	virtual uint64_t					objectAddress() const { return (_compiledAtom ? _compiledAtom->objectAddress() : 0); }
-	virtual void						copyRawContent(uint8_t buffer[]) const 
+	const char*					name() const override		{ return _name; }
+	uint64_t					size() const override		{ return (_compiledAtom ? _compiledAtom->size() : 0); }
+	uint64_t					objectAddress() const override { return (_compiledAtom ? _compiledAtom->objectAddress() : 0); }
+	void						copyRawContent(uint8_t buffer[]) const override
 															{ if (_compiledAtom) _compiledAtom->copyRawContent(buffer); }
-	virtual const uint8_t*				rawContentPointer() const 
+	const uint8_t*				rawContentPointer() const override
 															{ return (_compiledAtom ? _compiledAtom->rawContentPointer() : NULL);  }
-	virtual unsigned long				contentHash(const class ld::IndirectBindingTable& ibt) const 
+	unsigned long				contentHash(const class ld::IndirectBindingTable& ibt) const override
 															{ return (_compiledAtom ? _compiledAtom->contentHash(ibt) : 0);  }
-	virtual bool						canCoalesceWith(const ld::Atom& rhs, const class ld::IndirectBindingTable& ibt) const 
+	bool						canCoalesceWith(const ld::Atom& rhs, const class ld::IndirectBindingTable& ibt) const override
 															{ return (_compiledAtom ? _compiledAtom->canCoalesceWith(rhs,ibt) : false); }
-	virtual ld::Fixup::iterator				fixupsBegin() const	
+	ld::Fixup::iterator				fixupsBegin() const override
 															{ return (_compiledAtom ? _compiledAtom->fixupsBegin() : (ld::Fixup*)&_file._fixupToInternal); }
-	virtual ld::Fixup::iterator				fixupsEnd() const	
+	ld::Fixup::iterator				fixupsEnd() const override
 															{ return (_compiledAtom ? _compiledAtom->fixupsEnd() : &((ld::Fixup*)&_file._fixupToInternal)[1]); }
-	virtual ld::Atom::UnwindInfo::iterator	beginUnwind() const 
+	ld::Atom::UnwindInfo::iterator	beginUnwind() const override
 															{ return (_compiledAtom ? _compiledAtom->beginUnwind() : NULL); }
-	virtual ld::Atom::UnwindInfo::iterator	endUnwind() const	
+	ld::Atom::UnwindInfo::iterator	endUnwind() const override
 															{ return (_compiledAtom ? _compiledAtom->endUnwind() : NULL); }
-	virtual ld::Atom::LineInfo::iterator	beginLineInfo() const 
+	ld::Atom::LineInfo::iterator	beginLineInfo() const override
 															{ return (_compiledAtom ? _compiledAtom->beginLineInfo() : NULL); }
-	virtual ld::Atom::LineInfo::iterator	endLineInfo() const 
+	ld::Atom::LineInfo::iterator	endLineInfo() const override
 															{ return (_compiledAtom ? _compiledAtom->endLineInfo() : NULL); }
 															
 	const ld::Atom*						compiledAtom()		{ return _compiledAtom; }
@@ -221,11 +238,13 @@ public:
 												std::vector<const ld::Atom*>&		newAtoms, 
 												std::vector<const char*>&			additionalUndefines);
 
-	static const char*			ltoVersion()	{ return ::lto_get_version(); }
+	static const char*				ltoVersion()	{ return ::lto_get_version(); }
 
 private:
+
 	static const char*				tripletPrefixForArch(cpu_type_t arch);
-	static ld::relocatable::File*	parseMachOFile(const uint8_t* p, size_t len, const OptimizeOptions& options);
+	static ld::relocatable::File*	parseMachOFile(const uint8_t* p, size_t len, const std::string &path, const OptimizeOptions& options,
+												   ld::File::Ordinal ordinal);
 #if LTO_API_VERSION >= 7
 	static void ltoDiagnosticHandler(lto_codegen_diagnostic_severity_t, const char*, void*);
 #endif
@@ -236,23 +255,72 @@ private:
 	class AtomSyncer : public ld::File::AtomHandler {
 	public:
 							AtomSyncer(std::vector<const char*>& a, std::vector<const ld::Atom*>&na,
-										CStringToAtom la, CStringToAtom dla, const OptimizeOptions& options) :
-										_options(options), _additionalUndefines(a), _newAtoms(na), _llvmAtoms(la), _deadllvmAtoms(dla) { }
-		virtual void		doAtom(const class ld::Atom&);
-		virtual void		doFile(const class ld::File&) { }
+										const CStringToAtom &la, const CStringToAtom &dla, const OptimizeOptions& options) :
+										_options(options), _additionalUndefines(a), _newAtoms(na), _llvmAtoms(la), _deadllvmAtoms(dla), _lastProxiedAtom(NULL), _lastProxiedFile(NULL) {}
+		void		doAtom(const class ld::Atom&) override;
+		void		doFile(const class ld::File&) override { }
 		
-
 		const OptimizeOptions&			_options;
 		std::vector<const char*>&		_additionalUndefines;
 		std::vector<const ld::Atom*>&	_newAtoms;
-		CStringToAtom					_llvmAtoms;
-		CStringToAtom					_deadllvmAtoms;
+		const CStringToAtom					&_llvmAtoms;
+		const CStringToAtom					&_deadllvmAtoms;
+		const ld::Atom*					_lastProxiedAtom;
+		const ld::File*					_lastProxiedFile;
 	};
 
+	static void						setPreservedSymbols(const std::vector<const ld::Atom*>&	allAtoms,
+														ld::Internal&						state,
+														const OptimizeOptions&				options,
+														CStringToAtom &deadllvmAtoms,
+														CStringToAtom &llvmAtoms,
+														lto_code_gen_t generator);
+
+	static std::tuple<uint8_t *, size_t> codegen(const OptimizeOptions& options,
+												 ld::Internal&			state,
+												 lto_code_gen_t			generator,
+											     std::string&           object_path);
+
+
+	static void loadMachO(ld::relocatable::File*				machoFile,
+						  const OptimizeOptions&		options,
+						  ld::File::AtomHandler&		handler,
+						  std::vector<const ld::Atom*>&	newAtoms,
+						  std::vector<const char*>&		additionalUndefines,
+						  CStringToAtom					&llvmAtoms,
+						  CStringToAtom					&deadllvmAtoms);
+
+	static bool optimizeLTO(const std::vector<File*> files,
+							const std::vector<const ld::Atom*>&	allAtoms,
+							ld::Internal&						state,
+							const OptimizeOptions&				options,
+							ld::File::AtomHandler&				handler,
+							std::vector<const ld::Atom*>&		newAtoms,
+							std::vector<const char*>&			additionalUndefines);
+
+	static bool optimizeThinLTO(const std::vector<File*>&              Files,
+							    const std::vector<const ld::Atom*>&	allAtoms,
+								ld::Internal&						state,
+								const OptimizeOptions&				options,
+								ld::File::AtomHandler&				handler,
+								std::vector<const ld::Atom*>&		newAtoms,
+								std::vector<const char*>&			additionalUndefines);
+
+#if LTO_API_VERSION >= 18
+	static thinlto_code_gen_t init_thinlto_codegen(const std::vector<File*>&           files,
+												   const std::vector<const ld::Atom*>& allAtoms,
+												   ld::Internal&				       state,
+												   const OptimizeOptions&			   options,
+												   CStringToAtom&                      deadllvmAtoms,
+												   CStringToAtom&                      llvmAtoms);
+#endif
+
 	static std::vector<File*>		_s_files;
+	static bool						_s_llvmOptionsProcessed;
 };
 
 std::vector<File*> Parser::_s_files;
+bool Parser::_s_llvmOptionsProcessed = false;
 
 
 bool Parser::validFile(const uint8_t* fileContent, uint64_t fileLength, cpu_type_t architecture, cpu_subtype_t subarch)
@@ -303,7 +371,8 @@ File* Parser::parse(const uint8_t* fileContent, uint64_t fileLength, const char*
 }
 
 
-ld::relocatable::File* Parser::parseMachOFile(const uint8_t* p, size_t len, const OptimizeOptions& options) 
+ld::relocatable::File* Parser::parseMachOFile(const uint8_t* p, size_t len, const std::string &path, const OptimizeOptions& options,
+											  ld::File::Ordinal ordinal)
 {
 	mach_o::relocatable::ParserOptions objOpts;
 	objOpts.architecture		= options.arch;
@@ -315,27 +384,26 @@ ld::relocatable::File* Parser::parseMachOFile(const uint8_t* p, size_t len, cons
 	objOpts.neverConvertDwarf   = false;
 	objOpts.verboseOptimizationHints = options.verboseOptimizationHints;
 	objOpts.armUsesZeroCostExceptions = options.armUsesZeroCostExceptions;
-	objOpts.simulator			= options.simulator;
-	objOpts.ignoreMismatchPlatform = options.ignoreMismatchPlatform;
-	objOpts.platform			= options.platform;
+#if SUPPORT_ARCH_arm64e
+	objOpts.supportsAuthenticatedPointers = options.supportsAuthenticatedPointers;
+#endif
+	objOpts.platforms			= options.platforms;
 	objOpts.subType				= 0;
-	objOpts.minOSVersion			= 0; // ld64-port: https://gist.github.com/tpoechtrager/2efafec8ac996509b9d6
 	objOpts.srcKind				= ld::relocatable::File::kSourceLTO;
 	objOpts.treateBitcodeAsData = false;
 	objOpts.usingBitcode		= options.bitcodeBundle;
 	objOpts.maxDefaultCommonAlignment = options.maxDefaultCommonAlignment;
 
-	// mach-o parsing is done in-memory, but need path for debug notes
-	const char* path = "/tmp/lto.o";
+	const char *object_path = path.c_str();
+	if (path.empty())
+		object_path = "/tmp/lto.o";
+
 	time_t modTime = 0;
-	if ( options.tmpObjectFilePath != NULL ) {
-		path = options.tmpObjectFilePath;
-		struct stat statBuffer;
-		if ( stat(options.tmpObjectFilePath, &statBuffer) == 0 )
-			modTime = statBuffer.st_mtime;
-	}
-	
-	ld::relocatable::File* result = mach_o::relocatable::parse(p, len, path, modTime, ld::File::Ordinal::LTOOrdinal(), objOpts);
+	struct stat statBuffer;
+	if ( stat(object_path, &statBuffer) == 0 )
+		modTime = statBuffer.st_mtime;
+
+	ld::relocatable::File* result = mach_o::relocatable::parse(p, len, strdup(object_path), modTime, ordinal, objOpts);
 	if ( result != NULL )
 		return result;
 	throw "LLVM LTO, file is not of required architecture";
@@ -344,7 +412,7 @@ ld::relocatable::File* Parser::parseMachOFile(const uint8_t* p, size_t len, cons
 
 
 File::File(const char* pth, time_t mTime, ld::File::Ordinal ordinal, const uint8_t* content, uint32_t contentLength, cpu_type_t arch) 
-	: ld::relocatable::File(pth,mTime,ordinal), _architecture(arch), _internalAtom(*this), 
+	: ld::relocatable::File(pth,mTime,ordinal), _isThinLTO(false), _architecture(arch), _internalAtom(*this),
 	_atomArray(NULL), _atomArrayCount(0), _module(NULL), _path(pth),
 	_content(content), _contentLength(contentLength), _debugInfoPath(pth),
 	_section("__TEXT_", "__tmp_lto", ld::Section::typeTempLTO),
@@ -373,7 +441,11 @@ File::File(const char* pth, time_t mTime, ld::File::Ordinal ordinal, const uint8
 		throwf("could not parse object file %s: '%s', using libLTO version '%s'", pth, ::lto_get_error_message(), ::lto_get_version());
 
 	if ( log ) fprintf(stderr, "bitcode file: %s\n", pth);
-	
+
+#if LTO_API_VERSION >= 18
+	_isThinLTO = ::lto_module_is_thinlto(_module);
+#endif
+
 	// create atom for each global symbol in module
 	uint32_t count = ::lto_module_get_num_symbols(_module);
 	_atomArray = (Atom*)malloc(sizeof(Atom)*count);
@@ -487,6 +559,15 @@ bool File::mergeIntoGenerator(lto_code_gen_t generator, bool useSetModule) {
     return false;
 }
 
+#if LTO_API_VERSION >= 18
+void File::addToThinGenerator(thinlto_code_gen_t generator, int id) {
+	assert(!_module && "Expected module to be disposed");
+	std::string pathWithID = _path;
+	pathWithID += std::to_string(id);
+	::thinlto_codegen_add_module(generator, strdup(pathWithID.c_str()), (const char *)_content, _contentLength);
+}
+#endif
+
 void File::release()
 {
 	if ( _module != NULL )
@@ -568,79 +649,27 @@ void Parser::ltoDiagnosticHandler(lto_codegen_diagnostic_severity_t severity, co
 }
 #endif
 
-bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
-						ld::Internal&						state,
-						const OptimizeOptions&				options,
-						ld::File::AtomHandler&				handler,
-						std::vector<const ld::Atom*>&		newAtoms, 
-						std::vector<const char*>&			additionalUndefines)
-{
+
+/// Instruct libLTO about the list of symbols to preserve, compute deadllvmAtoms and llvmAtoms
+void Parser::setPreservedSymbols(	const std::vector<const ld::Atom*>&	allAtoms,
+									ld::Internal&						state,
+									const OptimizeOptions&				options,
+									CStringToAtom &deadllvmAtoms,
+									CStringToAtom &llvmAtoms,
+									lto_code_gen_t generator) {
 	const bool logMustPreserve = false;
-	const bool logExtraOptions = false;
-	const bool logBitcodeFiles = false;
-	const bool logAtomsBeforeSync = false;
 
-	// exit quickly if nothing to do
-	if ( _s_files.size() == 0 ) 
-		return false;
-	
-	// print out LTO version string if -v was used
-	if ( options.verbose )
-		fprintf(stderr, "%s\n", ::lto_get_version());
-	
-	// create optimizer and add each Reader
-	lto_code_gen_t generator = NULL;
-#if LTO_API_VERSION >= 11
-	if ( File::sSupportsLocalContext )
-		generator = ::lto_codegen_create_in_local_context();
-	else
-#endif
-		generator = ::lto_codegen_create();
-#if LTO_API_VERSION >= 7
-	lto_codegen_set_diagnostic_handler(generator, ltoDiagnosticHandler, NULL);
-#endif
-
-	// <rdar://problem/12379604> The order that files are merged must match command line order
-	std::sort(_s_files.begin(), _s_files.end(), CommandLineOrderFileSorter());
-	ld::File::Ordinal lastOrdinal;
-
-	// When flto_codegen_only is on and we have a single .bc file, use lto_codegen_set_module instead of
-	// lto_codegen_add_module, to make sure the the destination module will be the same as the input .bc file.
-	bool useSetModule = false;
-#if LTO_API_VERSION >= 13
-	useSetModule = (_s_files.size() == 1) && options.ltoCodegenOnly && (::lto_api_version() >= 13);
-#endif
-	for (std::vector<File*>::iterator it=_s_files.begin(); it != _s_files.end(); ++it) {
-		File* f = *it;
-		assert(f->ordinal() > lastOrdinal);
-		if ( logBitcodeFiles && !useSetModule) fprintf(stderr, "lto_codegen_add_module(%s)\n", f->path());
-		if ( logBitcodeFiles && useSetModule) fprintf(stderr, "lto_codegen_set_module(%s)\n", f->path());
-		if ( f->mergeIntoGenerator(generator, useSetModule) )
-			throwf("lto: could not merge in %s because '%s', using libLTO version '%s'", f->path(), ::lto_get_error_message(), ::lto_get_version());
-		lastOrdinal = f->ordinal();
-	}
-
-	// add any -mllvm command line options
-	for (std::vector<const char*>::const_iterator it=options.llvmOptions->begin(); it != options.llvmOptions->end(); ++it) {
-		if ( logExtraOptions ) fprintf(stderr, "passing option to llvm: %s\n", *it);
-		::lto_codegen_debug_options(generator, *it);
-	}
-
-	// <rdar://problem/13687397> Need a way for LTO to get cpu variants (until that info is in bitcode)
-	if ( options.mcpu != NULL )
-		::lto_codegen_set_cpu(generator, options.mcpu);
-
-	// The atom graph uses directed edges (references). Collect all references where 
-	// originating atom is not part of any LTO Reader. This allows optimizer to optimize an 
-	// external (i.e. not originated from same .o file) reference if all originating atoms are also 
+	// The atom graph uses directed edges (references). Collect all references where
+	// originating atom is not part of any LTO Reader. This allows optimizer to optimize an
+	// external (i.e. not originated from same .o file) reference if all originating atoms are also
 	// defined in llvm bitcode file.
 	CStringSet nonLLVMRefs;
-	CStringToAtom llvmAtoms;
-    bool hasNonllvmAtoms = false;
+	bool hasNonllvmAtoms = false;
 	for (std::vector<const ld::Atom*>::const_iterator it = allAtoms.begin(); it != allAtoms.end(); ++it) {
 		const ld::Atom* atom = *it;
-		// only look at references that come from an atom that is not an llvm atom
-		if ( atom->contentType() != ld::Atom::typeLTOtemporary ) {
+		// only look at references that come from an atom that is not an LTO atom
+		if (atom->contentType() != ld::Atom::typeLTOtemporary ||
+			((lto::File *)atom->file())->isThinLTO()) {
 			if ( (atom->section().type() != ld::Section::typeMachHeader) && (atom->definition() != ld::Atom::definitionProxy) ) {
 				hasNonllvmAtoms = true;
 			}
@@ -649,7 +678,7 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 				switch ( fit->binding ) {
 					case ld::Fixup::bindingDirectlyBound:
 						// that reference an llvm atom
-						if ( fit->u.target->contentType() == ld::Atom::typeLTOtemporary ) 
+						if ( fit->u.target->contentType() == ld::Atom::typeLTOtemporary )
 							nonLLVMRefs.insert(fit->u.target->name());
 						break;
 					case ld::Fixup::bindingsIndirectlyBound:
@@ -667,15 +696,14 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 	}
 	// if entry point is in a llvm bitcode file, it must be preserved by LTO
 	if ( state.entryPoint!= NULL ) {
-		if ( state.entryPoint->contentType() == ld::Atom::typeLTOtemporary ) 
+		if ( state.entryPoint->contentType() == ld::Atom::typeLTOtemporary )
 			nonLLVMRefs.insert(state.entryPoint->name());
 	}
-	
+
 	// deadAtoms are the atoms that the linker coalesced.  For instance weak or tentative definitions
 	// overriden by another atom.  If any of these deadAtoms are llvm atoms and they were replaced
-	// with a mach-o atom, we need to tell the lto engine to preserve (not optimize away) its dead 
+	// with a mach-o atom, we need to tell the lto engine to preserve (not optimize away) its dead
 	// atom so that the linker can replace it with the mach-o one later.
-	CStringToAtom deadllvmAtoms;
 	for (std::vector<const ld::Atom*>::const_iterator it = allAtoms.begin(); it != allAtoms.end(); ++it) {
 		const ld::Atom* atom = *it;
 		if ( atom->coalescedAway() && (atom->contentType() == ld::Atom::typeLTOtemporary) ) {
@@ -692,7 +720,7 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			if ( llvmAtom->coalescedAway()  ) {
 				const char* name = llvmAtom->name();
 				if ( deadllvmAtoms.find(name) == deadllvmAtoms.end() ) {
-					if ( logMustPreserve ) 
+					if ( logMustPreserve )
 						fprintf(stderr, "lto_codegen_add_must_preserve_symbol(%s) because linker coalesce away and replace with a mach-o atom\n", name);
 					::lto_codegen_add_must_preserve_symbol(generator, name);
 					deadllvmAtoms[name] = (Atom*)llvmAtom;
@@ -704,7 +732,7 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			}
 		}
 	}
-	
+
 	// tell code generator about symbols that must be preserved
 	for (CStringToAtom::iterator it = llvmAtoms.begin(); it != llvmAtoms.end(); ++it) {
 		const char* name = it->first;
@@ -713,7 +741,7 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 		// 1 - atom scope is global (and not linkage unit).
 		// 2 - included in nonLLVMRefs set.
 		// If a symbol is not listed in exportList then LTO is free to optimize it away.
-		if ( (atom->scope() == ld::Atom::scopeGlobal) && options.preserveAllGlobals ) { 
+		if ( (atom->scope() == ld::Atom::scopeGlobal) && options.preserveAllGlobals ) {
 			if ( logMustPreserve ) fprintf(stderr, "lto_codegen_add_must_preserve_symbol(%s) because global symbol\n", name);
 			::lto_codegen_add_must_preserve_symbol(generator, name);
 		}
@@ -727,16 +755,16 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			::lto_codegen_add_must_preserve_symbol(generator, name);
 		}
 	}
-	
+
 	// <rdar://problem/16165191> tell code generator to preserve initial undefines
 	for( std::vector<const char*>::const_iterator it=options.initialUndefines->begin(); it != options.initialUndefines->end(); ++it) {
 		if ( logMustPreserve ) fprintf(stderr, "lto_codegen_add_must_preserve_symbol(%s) because it is an initial undefine\n", *it);
 		::lto_codegen_add_must_preserve_symbol(generator, *it);
 	}
 
-    // special case running ld -r on all bitcode files to produce another bitcode file (instead of mach-o)
-    if ( options.relocatable && !hasNonllvmAtoms ) {
-#if LTO_API_VERSION >= 15
+	// special case running ld -r on all bitcode files to produce another bitcode file (instead of mach-o)
+	if ( options.relocatable && !hasNonllvmAtoms ) {
+#if LTO_API_VERSION >= 17
 		::lto_codegen_set_should_embed_uselists(generator, false);
 #endif
 		if ( ! ::lto_codegen_write_merged_modules(generator, options.outputFilePath) ) {
@@ -744,44 +772,62 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			exit(0);
 		}
 		warning("could not produce merged bitcode file");
-    }
-    
-	// set code-gen model
-	lto_codegen_model model = LTO_CODEGEN_PIC_MODEL_DYNAMIC;
+	}
+
+}
+
+// Retrieve the codegen model from the options
+static lto_codegen_model getCodeModel(const OptimizeOptions& options) {
 	if ( options.mainExecutable ) {
 		if ( options.staticExecutable ) {
 			// x86_64 "static" or any "-static -pie" is really dynamic code model
 			if ( (options.arch == CPU_TYPE_X86_64) || options.pie )
-				model = LTO_CODEGEN_PIC_MODEL_DYNAMIC;
+				return LTO_CODEGEN_PIC_MODEL_DYNAMIC;
 			else
-				model = LTO_CODEGEN_PIC_MODEL_STATIC;
+				return LTO_CODEGEN_PIC_MODEL_STATIC;
+		}
+		else if ( options.preload ) {
+			if ( options.pie )
+				return LTO_CODEGEN_PIC_MODEL_DYNAMIC;
+			else
+				return LTO_CODEGEN_PIC_MODEL_STATIC;
 		}
 		else {
 			if ( options.pie )
-				model = LTO_CODEGEN_PIC_MODEL_DYNAMIC;
+				return LTO_CODEGEN_PIC_MODEL_DYNAMIC;
 			else
-				model = LTO_CODEGEN_PIC_MODEL_DYNAMIC_NO_PIC;
+				return LTO_CODEGEN_PIC_MODEL_DYNAMIC_NO_PIC;
 		}
 	}
 	else {
 		if ( options.allowTextRelocs )
-			model = LTO_CODEGEN_PIC_MODEL_DYNAMIC_NO_PIC;
+			return LTO_CODEGEN_PIC_MODEL_DYNAMIC_NO_PIC;
 		else
-			model = LTO_CODEGEN_PIC_MODEL_DYNAMIC;
+			return LTO_CODEGEN_PIC_MODEL_DYNAMIC;
 	}
-	if ( ::lto_codegen_set_pic_model(generator, model) )
+
+}
+
+std::tuple<uint8_t *, size_t> Parser::codegen(const OptimizeOptions& options,
+											  ld::Internal&			 state,
+											  lto_code_gen_t		 generator,
+											  std::string&           object_path) {
+	uint8_t *machOFile = NULL; // ld64-port: = NULL
+	size_t machOFileLen;
+
+	if ( ::lto_codegen_set_pic_model(generator, getCodeModel(options)) )
 		throwf("could not create set codegen model: %s", lto_get_error_message());
 
-    // if requested, save off merged bitcode file
-    if ( options.saveTemps ) {
-        char tempBitcodePath[MAXPATHLEN];
-        strcpy(tempBitcodePath, options.outputFilePath);
-        strcat(tempBitcodePath, ".lto.bc");
-#if LTO_API_VERSION >= 15
-        ::lto_codegen_set_should_embed_uselists(generator, true);
+	// if requested, save off merged bitcode file
+	if ( options.saveTemps ) {
+		char tempBitcodePath[MAXPATHLEN];
+		strcpy(tempBitcodePath, options.outputFilePath);
+		strcat(tempBitcodePath, ".lto.bc");
+#if LTO_API_VERSION >= 17
+		::lto_codegen_set_should_embed_uselists(generator, true);
 #endif
-        ::lto_codegen_write_merged_modules(generator, tempBitcodePath);
-    }
+		::lto_codegen_write_merged_modules(generator, tempBitcodePath);
+	}
 
 #if LTO_API_VERSION >= 3
 	// find assembler next to linker
@@ -810,22 +856,21 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 	}
 #endif
 
-	// When lto API version is greater than or equal to 12, we use lto_codegen_optimize and lto_codegen_compile_optimized
+	// When lto API version is greater than or equal to 17, we use lto_codegen_optimize and lto_codegen_compile_optimized
 	// instead of lto_codegen_compile, and we save the merged bitcode file in between.
 	bool useSplitAPI = false;
-#if LTO_API_VERSION >= 12
+#if LTO_API_VERSION >= 17
 	if ( ::lto_api_version() >= 12)
 		useSplitAPI = true;
 #endif
 
-	size_t machOFileLen = 0;
-	const uint8_t* machOFile = NULL;
 	if ( useSplitAPI) {
-#if LTO_API_VERSION >= 12
-#if LTO_API_VERSION >= 14
-	if ( ::lto_api_version() >= 14 && options.ltoCodegenOnly)
-          lto_codegen_set_should_internalize(generator, false);
-#endif
+// ld64-port: Fixed wrong if conditions
+#if LTO_API_VERSION >= 17
+//#if LTO_API_VERSION >= 14
+		if ( ::lto_api_version() >= 17 && options.ltoCodegenOnly)
+			lto_codegen_set_should_internalize(generator, false);
+//#endif
 		// run optimizer
 		if ( !options.ltoCodegenOnly && ::lto_codegen_optimize(generator) )
 			throwf("could not do LTO optimization: '%s', using libLTO version '%s'", ::lto_get_error_message(), ::lto_get_version());
@@ -835,12 +880,12 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			char tempOptBitcodePath[MAXPATHLEN];
 			strcpy(tempOptBitcodePath, options.outputFilePath);
 			strcat(tempOptBitcodePath, ".lto.opt.bc");
-#if LTO_API_VERSION >= 15
+//#if LTO_API_VERSION >= 15
 			::lto_codegen_set_should_embed_uselists(generator, true);
-#endif
+//#endif
 			::lto_codegen_write_merged_modules(generator, tempOptBitcodePath);
 			if ( options.bitcodeBundle )
-				state.ltoBitcodePath = tempOptBitcodePath;
+				state.ltoBitcodePath.push_back(tempOptBitcodePath);
 		}
 
 		// run code generator
@@ -859,19 +904,19 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			char tempOptBitcodePath[MAXPATHLEN];
 			strcpy(tempOptBitcodePath, options.outputFilePath);
 			strcat(tempOptBitcodePath, ".lto.opt.bc");
-#if LTO_API_VERSION >= 15
+#if LTO_API_VERSION >= 17
 			::lto_codegen_set_should_embed_uselists(generator, true);
 #endif
 			::lto_codegen_write_merged_modules(generator, tempOptBitcodePath);
 		}
 	}
-	
-    // if requested, save off temp mach-o file
-    if ( options.saveTemps ) {
-        char tempMachoPath[MAXPATHLEN];
-        strcpy(tempMachoPath, options.outputFilePath);
-        strcat(tempMachoPath, ".lto.o");
-        int fd = ::open(tempMachoPath, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+
+	// if requested, save off temp mach-o file
+	if ( options.saveTemps ) {
+		char tempMachoPath[MAXPATHLEN];
+		strcpy(tempMachoPath, options.outputFilePath);
+		strcat(tempMachoPath, ".lto.o");
+		int fd = ::open(tempMachoPath, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 		if ( fd != -1) {
 			::write(fd, machOFile, machOFileLen);
 			::close(fd);
@@ -879,20 +924,30 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 	}
 
 	// if needed, save temp mach-o file to specific location
-	if ( options.tmpObjectFilePath != NULL ) {
-		int fd = ::open(options.tmpObjectFilePath, O_CREAT | O_WRONLY | O_TRUNC, 0666);
+	if ( !object_path.empty() ) {
+		int fd = ::open(object_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
 		if ( fd != -1) {
 			::write(fd, machOFile, machOFileLen);
 			::close(fd);
 		}
 		else {
-			warning("could not write LTO temp file '%s', errno=%d", options.tmpObjectFilePath, errno);
+			warning("could not write LTO temp file '%s', errno=%d", object_path.c_str(), errno);
 		}
 	}
-	
-	// parse generated mach-o file into a MachOReader
-	ld::relocatable::File* machoFile = parseMachOFile(machOFile, machOFileLen, options);
-	
+	return std::make_tuple(machOFile, machOFileLen);
+}
+
+/// Load the MachO located in buffer \p machOFile with size \p machOFileLen.
+/// The loaded atoms are sync'ed using all the supplied lists.
+void Parser::loadMachO(ld::relocatable::File*				machoFile,
+					   const OptimizeOptions&				options,
+					   ld::File::AtomHandler&				handler,
+					   std::vector<const ld::Atom*>&		newAtoms,
+					   std::vector<const char*>&			additionalUndefines,
+					   CStringToAtom						&llvmAtoms,
+					   CStringToAtom						&deadllvmAtoms) {
+	const bool logAtomsBeforeSync = false;
+
 	// sync generated mach-o atoms with existing atoms ld knows about
 	if ( logAtomsBeforeSync ) {
 		fprintf(stderr, "llvmAtoms:\n");
@@ -910,11 +965,96 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 	}
 	AtomSyncer syncer(additionalUndefines, newAtoms, llvmAtoms, deadllvmAtoms, options);
 	machoFile->forEachAtom(syncer);
-			
-	// Remove InternalAtoms from ld
-	for (std::vector<File*>::iterator it=_s_files.begin(); it != _s_files.end(); ++it) {
-		(*it)->internalAtom().setCoalescedAway();
+
+	// notify about file level attributes
+	handler.doFile(*machoFile);
+}
+
+// Full LTO processing
+bool Parser::optimizeLTO(const std::vector<File*>				files,
+						 const std::vector<const ld::Atom*>&	allAtoms,
+						 ld::Internal&							state,
+						 const OptimizeOptions&					options,
+						 ld::File::AtomHandler&					handler,
+						 std::vector<const ld::Atom*>&			newAtoms,
+						 std::vector<const char*>&				additionalUndefines) {
+	const bool logExtraOptions = false;
+	const bool logBitcodeFiles = false;
+
+	if (files.empty())
+		return true;
+
+	// create optimizer and add each Reader
+	lto_code_gen_t generator = NULL;
+#if LTO_API_VERSION >= 11
+	if ( File::sSupportsLocalContext )
+		generator = ::lto_codegen_create_in_local_context();
+	else
+#endif
+		generator = ::lto_codegen_create();
+#if LTO_API_VERSION >= 7
+	lto_codegen_set_diagnostic_handler(generator, ltoDiagnosticHandler, NULL);
+#endif
+
+	ld::File::Ordinal lastOrdinal;
+
+	// When flto_codegen_only is on and we have a single .bc file, use lto_codegen_set_module instead of
+	// lto_codegen_add_module, to make sure the the destination module will be the same as the input .bc file.
+	bool useSetModule = false;
+#if LTO_API_VERSION >= 13
+	useSetModule = (files.size() == 1) && options.ltoCodegenOnly && (::lto_api_version() >= 13);
+#endif
+	for (auto *f : files) {
+		assert(f->ordinal() > lastOrdinal);
+		if ( logBitcodeFiles && !useSetModule ) fprintf(stderr, "lto_codegen_add_module(%s)\n", f->path());
+		if ( logBitcodeFiles && useSetModule ) fprintf(stderr, "lto_codegen_set_module(%s)\n", f->path());
+		if ( f->mergeIntoGenerator(generator, useSetModule) )
+			throwf("lto: could not merge in %s because '%s', using libLTO version '%s'", f->path(), ::lto_get_error_message(), ::lto_get_version());
+		lastOrdinal = f->ordinal();
 	}
+
+	// add any -mllvm command line options
+	if ( !_s_llvmOptionsProcessed ) {
+		for (const char* opt : *options.llvmOptions) {
+			if ( logExtraOptions ) fprintf(stderr, "passing option to llvm: %s\n", opt);
+			::lto_codegen_debug_options(generator, opt);
+		}
+		_s_llvmOptionsProcessed = true;
+	}
+
+	// <rdar://problem/13687397> Need a way for LTO to get cpu variants (until that info is in bitcode)
+	if ( options.mcpu != NULL )
+		::lto_codegen_set_cpu(generator, options.mcpu);
+
+	// Compute the preserved symbols
+	CStringToAtom deadllvmAtoms, llvmAtoms;
+	setPreservedSymbols(allAtoms, state, options, deadllvmAtoms, llvmAtoms, generator);
+
+	size_t machOFileLen = 0;
+	const uint8_t* machOFile = NULL;
+
+	// mach-o parsing is done in-memory, but need path for debug notes
+	std::string object_path;
+	if ( options.tmpObjectFilePath != NULL ) {
+		object_path = options.tmpObjectFilePath;
+		// If the path exists and is a directory (for instance if some files
+		// were processed with ThinLTO before), we create the LTO file inside
+		// the directory.
+		struct stat statBuffer;
+		if( stat(object_path.c_str(), &statBuffer) == 0 && S_ISDIR(statBuffer.st_mode) ) {
+			object_path += "/lto.o";
+		}
+	}
+
+	// Codegen Now
+	std::tie(machOFile, machOFileLen) = codegen(options, state, generator, object_path);
+
+	// parse generated mach-o file into a MachOReader
+	ld::relocatable::File* machoFile = parseMachOFile(machOFile, machOFileLen, object_path, options, ld::File::Ordinal::LTOOrdinal());
+
+	// Load the generated MachO file
+	loadMachO(machoFile, options, handler, newAtoms, additionalUndefines, llvmAtoms, deadllvmAtoms);
+
 	// Remove Atoms from ld if code generator optimized them away
 	for (CStringToAtom::iterator li = llvmAtoms.begin(), le = llvmAtoms.end(); li != le; ++li) {
 		// check if setRealAtom() called on this Atom
@@ -923,49 +1063,502 @@ bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 			li->second->setCoalescedAway();
 		}
 	}
-	
-	// notify about file level attributes
-	handler.doFile(*machoFile);
-	
+
 	// if final mach-o file has debug info, update original bitcode files to match
-	for (std::vector<File*>::iterator it=_s_files.begin(); it != _s_files.end(); ++it) {
-		(*it)->setDebugInfo(machoFile->debugInfo(), machoFile->path(),
-							machoFile->modificationTime(), machoFile->cpuSubType());
+	for (auto *f : files) {
+		f->setDebugInfo(machoFile->debugInfo(), machoFile->path(), machoFile->modificationTime(), machoFile->cpuSubType());
 	}
-	
+
 	return true;
+}
+
+#if LTO_API_VERSION >= 18
+// Create the ThinLTO codegenerator
+thinlto_code_gen_t Parser::init_thinlto_codegen(const std::vector<File*>&           files,
+									            const std::vector<const ld::Atom*>& allAtoms,
+												ld::Internal&				       state,
+												const OptimizeOptions&			   options,
+											    CStringToAtom&                      deadllvmAtoms,
+											    CStringToAtom&                      llvmAtoms) {
+	const bool logMustPreserve = false;
+
+    thinlto_code_gen_t thingenerator = ::thinlto_create_codegen();
+
+	// Caching control
+	if (options.ltoCachePath && !options.bitcodeBundle) {
+		struct stat statBuffer;
+		if( stat(options.ltoCachePath, &statBuffer) != 0 || !S_ISDIR(statBuffer.st_mode) ) {
+			if ( mkdir(options.ltoCachePath, 0700) !=0 ) {
+				warning("unable to create ThinLTO cache directory: %s", options.ltoCachePath);
+			}
+		}
+		thinlto_codegen_set_cache_dir(thingenerator, options.ltoCachePath);
+		if (options.ltoPruneIntervalOverwrite)
+			thinlto_codegen_set_cache_pruning_interval(thingenerator, options.ltoPruneInterval);
+		thinlto_codegen_set_cache_entry_expiration(thingenerator, options.ltoPruneAfter);
+		thinlto_codegen_set_final_cache_size_relative_to_available_space(thingenerator, options.ltoMaxCacheSize);
+	}
+
+	// if requested, ask the code generator to save off intermediate bitcode files
+	if ( options.saveTemps ) {
+		std::string tempPath = options.outputFilePath;
+		tempPath += ".thinlto.bcs/";
+		struct stat statBuffer;
+		if( stat(tempPath.c_str(), &statBuffer) != 0 || !S_ISDIR(statBuffer.st_mode) ) {
+			if ( mkdir(tempPath.c_str(), 0700) !=0 ) {
+				warning("unable to create ThinLTO output directory for temporary bitcode files: %s", tempPath.c_str());
+			}
+		}
+		thinlto_codegen_set_savetemps_dir(thingenerator, tempPath.c_str());
+	}
+
+	// Set some codegen options
+	if ( thinlto_codegen_set_pic_model(thingenerator, getCodeModel(options)) )
+		throwf("could not create set codegen model: %s", lto_get_error_message());
+
+	// Expose reachability informations for internalization in LTO
+
+	// The atom graph uses directed edges (references). Collect all references where
+	// originating atom is not part of any LTO Reader. This allows optimizer to optimize an
+	// external (i.e. not originated from same .o file) reference if all originating atoms are also
+	// defined in llvm bitcode file.
+	CStringSet nonLLVMRefs;
+	CStringSet LLVMRefs;
+	for (std::vector<const ld::Atom*>::const_iterator it = allAtoms.begin(); it != allAtoms.end(); ++it) {
+		const ld::Atom* atom = *it;
+		const ld::Atom* target;
+		for (ld::Fixup::iterator fit=atom->fixupsBegin(); fit != atom->fixupsEnd(); ++fit) {
+			switch ( fit->binding ) {
+				case ld::Fixup::bindingDirectlyBound:
+					// that reference a ThinLTO llvm atom
+					target = fit->u.target;
+					if ( target->contentType() == ld::Atom::typeLTOtemporary &&
+						((lto::File *)target->file())->isThinLTO() &&
+						atom->file() != target->file()
+						) {
+						if (atom->contentType() != ld::Atom::typeLTOtemporary ||
+							!((lto::File *)atom->file())->isThinLTO())
+							nonLLVMRefs.insert(target->name());
+						else
+							LLVMRefs.insert(target->name());
+						if ( logMustPreserve )
+							fprintf(stderr, "Found a reference from %s -> %s\n", atom->name(), target->name());
+					}
+					break;
+				case ld::Fixup::bindingsIndirectlyBound:
+					target = state.indirectBindingTable[fit->u.bindingIndex];
+					if ( (target != NULL) && (target->contentType() == ld::Atom::typeLTOtemporary)  &&
+						((lto::File *)target->file())->isThinLTO() &&
+						atom->file() != target->file()
+						) {
+						if (atom->contentType() != ld::Atom::typeLTOtemporary ||
+							!((lto::File *)atom->file())->isThinLTO())
+							nonLLVMRefs.insert(target->name());
+						else
+							LLVMRefs.insert(target->name());
+						if ( logMustPreserve )
+							fprintf(stderr, "Found a reference from %s -> %s\n", atom->name(), target->name());
+					}
+				default:
+					break;
+			}
+		}
+		if (atom->contentType() == ld::Atom::typeLTOtemporary &&
+			((lto::File *)atom->file())->isThinLTO() &&
+			atom != &((lto::File *)atom->file())->internalAtom()) {
+			assert(atom->scope() != ld::Atom::scopeTranslationUnit && "LTO should not expose static atoms");
+			assert(llvmAtoms.find(atom->name()) == llvmAtoms.end() && "Unexpected llvmAtom with duplicate name");
+			llvmAtoms[atom->name()] = (Atom*)atom;
+		}
+	}
+	// if entry point is in a llvm bitcode file, it must be preserved by LTO
+	if ( state.entryPoint != NULL ) {
+		if ( state.entryPoint->contentType() == ld::Atom::typeLTOtemporary )
+			nonLLVMRefs.insert(state.entryPoint->name());
+	}
+	for (auto file : files) {
+		for(uint32_t i=0; i < file->_atomArrayCount; ++i) {
+			Atom* llvmAtom = &file->_atomArray[i];
+			if ( llvmAtom->coalescedAway()  ) {
+				const char* name = llvmAtom->name();
+				if ( deadllvmAtoms.find(name) == deadllvmAtoms.end() ) {
+					if ( logMustPreserve )
+						fprintf(stderr, "thinlto_codegen_add_must_preserve_symbol(%s) because linker coalesce away and replace with a mach-o atom\n", name);
+					::thinlto_codegen_add_must_preserve_symbol(thingenerator, name, strlen(name));
+					deadllvmAtoms[name] = (Atom*)llvmAtom;
+				}
+			}
+			else if ( options.linkerDeadStripping && !llvmAtom->live() ) {
+				const char* name = llvmAtom->name();
+				deadllvmAtoms[name] = (Atom*)llvmAtom;
+			}
+		}
+	}
+
+	// tell code generator about symbols that must be preserved
+	for (CStringToAtom::iterator it = llvmAtoms.begin(); it != llvmAtoms.end(); ++it) {
+		const char* name = it->first;
+		Atom* atom = it->second;
+		// Include llvm Symbol in export list if it meets one of following two conditions
+		// 1 - atom scope is global (and not linkage unit).
+		// 2 - included in nonLLVMRefs set.
+		// If a symbol is not listed in exportList then LTO is free to optimize it away.
+		if ( (atom->scope() == ld::Atom::scopeGlobal) && options.preserveAllGlobals ) {
+			if ( logMustPreserve ) fprintf(stderr, "thinlto_codegen_add_must_preserve_symbol(%s) because global symbol\n", name);
+			::thinlto_codegen_add_must_preserve_symbol(thingenerator, name, strlen(name));
+		}
+		else if ( nonLLVMRefs.find(name) != nonLLVMRefs.end() ) {
+			if ( logMustPreserve ) fprintf(stderr, "thinlto_codegen_add_must_preserve_symbol(%s) because referenced from outside of ThinLTO\n", name);
+			::thinlto_codegen_add_must_preserve_symbol(thingenerator, name, strlen(name));
+		}
+		else if ( LLVMRefs.find(name) != LLVMRefs.end() ) {
+			if ( logMustPreserve ) fprintf(stderr, "thinlto_codegen_add_cross_referenced_symbol(%s) because referenced from another file\n", name);
+			::thinlto_codegen_add_cross_referenced_symbol(thingenerator, name, strlen(name));
+		} else {
+			if ( logMustPreserve ) fprintf(stderr, "NOT preserving(%s)\n", name);
+		}
+
+		// <rdar://problem/16165191> tell code generator to preserve initial undefines
+		for (const char* undefName : *options.initialUndefines) {
+			if ( logMustPreserve ) fprintf(stderr, "thinlto_codegen_add_cross_referenced_symbol(%s) because it is an initial undefine\n", undefName);
+			::thinlto_codegen_add_cross_referenced_symbol(thingenerator, undefName, strlen(undefName));
+		}
+
+// FIXME: to be implemented
+//		else if ( options.relocatable && hasNonllvmAtoms ) {
+//			// <rdar://problem/14334895> ld -r mode but merging in some mach-o files, so need to keep libLTO from optimizing away anything
+//			if ( logMustPreserve ) fprintf(stderr, "lto_codegen_add_must_preserve_symbol(%s) because -r mode disable LTO dead stripping\n", name);
+//			::thinlto_codegen_add_must_preserve_symbol(thingenerator, name, strlen(name));
+//		}
+	}
+
+	return thingenerator;
+}
+#endif
+
+// Full LTO processing
+bool Parser::optimizeThinLTO(const std::vector<File*>&              files,
+							 const std::vector<const ld::Atom*>&	allAtoms,
+							 ld::Internal&							state,
+							 const OptimizeOptions&					options,
+							 ld::File::AtomHandler&					handler,
+							 std::vector<const ld::Atom*>&			newAtoms,
+							 std::vector<const char*>&				additionalUndefines) {
+	const bool logBitcodeFiles = false;
+
+	if (files.empty())
+		return true;
+
+#if LTO_API_VERSION >= 18
+
+	if (::lto_api_version() < 18)
+		throwf("lto: could not use -thinlto because libLTO is too old (version '%d', >=18 is required)", ::lto_api_version());
+
+	// Handle -mllvm options
+	if ( !_s_llvmOptionsProcessed ) {
+		thinlto_debug_options(options.llvmOptions->data(), options.llvmOptions->size());
+		_s_llvmOptionsProcessed = true;
+	}
+
+	// Create the ThinLTO codegenerator
+	CStringToAtom                     deadllvmAtoms;
+	CStringToAtom                     llvmAtoms;
+	thinlto_code_gen_t thingenerator = init_thinlto_codegen(files, allAtoms, state, options, deadllvmAtoms, llvmAtoms);
+
+
+	ld::File::Ordinal lastOrdinal;
+	int FileId = 0;
+	for (auto *f : files) {
+		if ( logBitcodeFiles) fprintf(stderr, "thinlto_codegen_add_module(%s)\n", f->path());
+		f->addToThinGenerator(thingenerator, FileId++);
+		lastOrdinal = f->ordinal();
+	}
+
+#if LTO_API_VERSION >= 19
+	// In the bitcode bundle case, we first run the generator with codegen disabled
+	// and get the bitcode output. These files are added for later bundling, and a
+	// new codegenerator is setup with these as input, and the optimizer disabled.
+	if (options.bitcodeBundle) {
+		// Bitcode Bundle case
+		thinlto_codegen_disable_codegen(thingenerator, true);
+		// Process the optimizer only
+		thinlto_codegen_process(thingenerator);
+		auto numObjects = thinlto_module_get_num_objects(thingenerator);
+		// Save the codegenerator
+		thinlto_code_gen_t bitcode_generator = thingenerator;
+		// Create a new codegen generator for the codegen part.
+		// Clear out the stored atoms so we can recompute them.
+		deadllvmAtoms.clear();
+		llvmAtoms.clear();
+		thingenerator = init_thinlto_codegen(files, allAtoms, state, options, deadllvmAtoms, llvmAtoms);
+		// Disable the optimizer
+		thinlto_codegen_set_codegen_only(thingenerator, true);
+
+		// Save bitcode files for later, and add them to the codegen generator.
+		for (unsigned bufID = 0; bufID < numObjects; ++bufID) {
+			auto machOFile = thinlto_module_get_object(bitcode_generator, bufID);
+			std::string tempMachoPath = options.outputFilePath;
+			tempMachoPath += ".";
+			tempMachoPath += std::to_string(bufID);
+			tempMachoPath += ".thinlto.o.bc";
+			state.ltoBitcodePath.push_back(tempMachoPath);
+			int fd = ::open(tempMachoPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+			if ( fd != -1 ) {
+				::write(fd, machOFile.Buffer, machOFile.Size);
+				::close(fd);
+			} else {
+				throwf("unable to write temporary ThinLTO output: %s", tempMachoPath.c_str());
+			}
+
+			// Add the optimized bitcode to the codegen generator now.
+			::thinlto_codegen_add_module(thingenerator, strdup(tempMachoPath.c_str()), (const char *)machOFile.Buffer, machOFile.Size);
+		}
+	}
+
+	if (options.ltoCodegenOnly)
+		// Disable the optimizer
+		thinlto_codegen_set_codegen_only(thingenerator, true);
+#endif
+
+	// If object_path_lto is used, we switch to a file-based API: libLTO will
+	// generate the files on disk and we'll map them on-demand.
+
+#if LTO_API_VERSION >= 21
+	bool useFileBasedAPI = (options.tmpObjectFilePath && ::lto_api_version() >= 21);
+	if ( useFileBasedAPI )
+		thinlto_set_generated_objects_dir(thingenerator, options.tmpObjectFilePath);
+#endif
+
+	// run code generator
+	thinlto_codegen_process(thingenerator);
+
+	unsigned numObjects;
+#if LTO_API_VERSION >= 21
+	if ( useFileBasedAPI )
+		numObjects = thinlto_module_get_num_object_files(thingenerator);
+	else
+#endif
+		numObjects = thinlto_module_get_num_objects(thingenerator);
+	if ( numObjects == 0 )
+		throwf("could not do ThinLTO codegen (thinlto_codegen_process didn't produce any object): '%s', using libLTO version '%s'", ::lto_get_error_message(), ::lto_get_version());
+
+	auto get_thinlto_buffer_or_load_file = [&] (unsigned ID) {
+#if LTO_API_VERSION >= 21
+		if ( useFileBasedAPI ) {
+			const char* path = thinlto_module_get_object_file(thingenerator, ID);
+			// map in whole file
+			struct stat stat_buf;
+			int fd = ::open(path, O_RDONLY, 0);
+			if ( fd == -1 )
+				throwf("can't open thinlto file '%s', errno=%d", path, errno);
+			if ( ::fstat(fd, &stat_buf) != 0 )
+				throwf("fstat thinlto file '%s' failed, errno=%d\n", path, errno);
+			size_t len = stat_buf.st_size;
+			if ( len < 20 )
+				throwf("ThinLTO file '%s' too small (length=%zu)", path, len);
+			const char* p = (const char*)::mmap(NULL, len, PROT_READ, MAP_FILE | MAP_PRIVATE, fd, 0);
+			if ( p == (const char*)(-1) )
+				throwf("can't map file, errno=%d", errno);
+			::close(fd);
+			return LTOObjectBuffer{ p, len };
+		}
+#endif
+		return thinlto_module_get_object(thingenerator, ID);
+	};
+
+	// if requested, save off objects files
+	if ( options.saveTemps ) {
+		for (unsigned bufID = 0; bufID < numObjects; ++bufID) {
+			auto machOFile = get_thinlto_buffer_or_load_file(bufID);
+			std::string tempMachoPath = options.outputFilePath;
+			tempMachoPath += ".";
+			tempMachoPath += std::to_string(bufID);
+			tempMachoPath += ".thinlto.o";
+			int fd = ::open(tempMachoPath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+			if ( fd != -1 ) {
+				::write(fd, machOFile.Buffer, machOFile.Size);
+				::close(fd);
+			}
+			else {
+				warning("unable to write temporary ThinLTO output: %s", tempMachoPath.c_str());
+			}
+		}
+	}
+
+	// mach-o parsing is done in-memory, but need path for debug notes
+	std::string macho_dirpath = "/tmp/thinlto.o";
+	if ( options.tmpObjectFilePath != NULL ) {
+		macho_dirpath = options.tmpObjectFilePath;
+		struct stat statBuffer;
+		if( stat(macho_dirpath.c_str(), &statBuffer) != 0 || !S_ISDIR(statBuffer.st_mode) ) {
+			unlink(macho_dirpath.c_str());
+			if ( mkdir(macho_dirpath.c_str(), 0700) !=0 ) {
+				warning("unable to create ThinLTO output directory for temporary object files: %s", macho_dirpath.c_str());
+			}
+		}
+	}
+
+	auto ordinal = ld::File::Ordinal::LTOOrdinal().nextFileListOrdinal();
+	for (unsigned bufID = 0; bufID < numObjects; ++bufID) {
+		auto machOFile = get_thinlto_buffer_or_load_file(bufID);
+		if (!machOFile.Size) {
+			warning("Ignoring empty buffer generated by ThinLTO");
+			continue;
+		}
+
+		// mach-o parsing is done in-memory, but need path for debug notes
+		std::string tmp_path;
+#if LTO_API_VERSION >= 21
+		if ( useFileBasedAPI ) {
+			tmp_path = thinlto_module_get_object_file(thingenerator, bufID);
+		}
+		else
+#endif
+		if ( options.tmpObjectFilePath != NULL) {
+			tmp_path = macho_dirpath + "/" + std::to_string(bufID) + ".o";
+			// if needed, save temp mach-o file to specific location
+			int fd = ::open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+			if ( fd != -1) {
+				::write(fd, (const uint8_t *)machOFile.Buffer, machOFile.Size);
+				::close(fd);
+			}
+			else {
+				warning("could not write ThinLTO temp file '%s', errno=%d", tmp_path.c_str(), errno);
+			}
+		}
+
+		// parse generated mach-o file into a MachOReader
+		ld::relocatable::File* machoFile = parseMachOFile((const uint8_t *)machOFile.Buffer, machOFile.Size, tmp_path, options, ordinal);
+		ordinal = ordinal.nextFileListOrdinal();
+
+		// Load the generated MachO file
+		loadMachO(machoFile, options, handler, newAtoms, additionalUndefines, llvmAtoms, deadllvmAtoms);
+	}
+
+	// Remove Atoms from ld if code generator optimized them away
+	for (CStringToAtom::iterator li = llvmAtoms.begin(), le = llvmAtoms.end(); li != le; ++li) {
+		// check if setRealAtom() called on this Atom
+		if ( li->second->compiledAtom() == NULL ) {
+			//fprintf(stderr, "llvm optimized away %p %s\n", li->second, li->second->name());
+			li->second->setCoalescedAway();
+		}
+	}
+
+	return true;
+#else // ! (LTO_API_VERSION >= 18)
+	throwf("lto: could not use -thinlto because ld was built against a version of libLTO too old (version '%d', >=18 is required)", LTO_API_VERSION);
+#endif
+}
+
+bool Parser::optimize(  const std::vector<const ld::Atom*>&	allAtoms,
+						ld::Internal&						state,
+						const OptimizeOptions&				options,
+						ld::File::AtomHandler&				handler,
+						std::vector<const ld::Atom*>&		newAtoms,
+						std::vector<const char*>&			additionalUndefines)
+{
+
+	// exit quickly if nothing to do
+	if ( _s_files.size() == 0 )
+		return false;
+
+	// print out LTO version string if -v was used
+	if ( options.verbose )
+		fprintf(stderr, "%s\n", ::lto_get_version());
+
+	// <rdar://problem/12379604> The order that files are merged must match command line order
+	std::sort(_s_files.begin(), _s_files.end(), CommandLineOrderFileSorter());
+
+#if LTO_API_VERSION >= 19
+	// If ltoCodegenOnly is set, we don't want to merge any bitcode files and perform FullLTO
+	// we just take the ThinLTO path (optimization will be disabled anyway).
+	if (options.ltoCodegenOnly) {
+		for (auto *file : _s_files) {
+			file->setIsThinLTO(true);
+		}
+	}
+#endif
+
+	std::vector<File *> theLTOFiles;
+	std::vector<File *> theThinLTOFiles;
+	for (auto *file : _s_files) {
+		if (file->isThinLTO()) {
+			theThinLTOFiles.push_back(file);
+		} else {
+			theLTOFiles.push_back(file);
+		}
+	}
+
+	auto result =  optimizeThinLTO(theThinLTOFiles, allAtoms, state, options, handler, newAtoms, additionalUndefines) &&
+				   optimizeLTO(theLTOFiles, allAtoms, state, options, handler, newAtoms, additionalUndefines);
+
+	// Remove InternalAtoms from ld
+	for (std::vector<File*>::iterator it=_s_files.begin(); it != _s_files.end(); ++it) {
+		(*it)->internalAtom().setCoalescedAway();
+	}
+
+	return result;
 }
 
 
 void Parser::AtomSyncer::doAtom(const ld::Atom& machoAtom)
 {
 	static const bool log = false;
-	static const ld::Atom* lastProxiedAtom = NULL;
-	static const ld::File* lastProxiedFile = NULL;
 	// update proxy atoms to point to real atoms and find new atoms
 	const char* name = machoAtom.name();
-	CStringToAtom::iterator pos = _llvmAtoms.find(name);
-	if ( pos != _llvmAtoms.end() ) {
+	CStringToAtom::const_iterator pos = _llvmAtoms.find(name);
+	if ( (pos != _llvmAtoms.end()) && (machoAtom.scope() != ld::Atom::scopeTranslationUnit) ) {
 		// turn Atom into a proxy for this mach-o atom
+		if (pos->second->scope() == ld::Atom::scopeLinkageUnit) {
+			if (log) fprintf(stderr, "demote %s to hidden after LTO\n", name);
+			(const_cast<ld::Atom*>(&machoAtom))->setScope(ld::Atom::scopeLinkageUnit);
+		}
+		// If both llvmAtom and machoAtom has the same scope and combine, but machoAtom loses auto hide, add it back.
+		// rdar://problem/38646854
+		if (pos->second->scope() == machoAtom.scope() &&
+			pos->second->combine() == machoAtom.combine() &&
+			pos->second->autoHide() && !machoAtom.autoHide()) {
+			if (log) fprintf(stderr, "set %s to auto hide after LTO\n", name);
+			(const_cast<ld::Atom*>(&machoAtom))->setAutoHide();
+		}
 		pos->second->setCompiledAtom(machoAtom);
-		lastProxiedAtom = &machoAtom;
-		lastProxiedFile = pos->second->file();
+		_lastProxiedAtom = &machoAtom;
+		_lastProxiedFile = pos->second->file();
 		if (log) fprintf(stderr, "AtomSyncer, mach-o atom %p synced to lto atom %p (name=%s)\n", &machoAtom, pos->second, machoAtom.name());
 	}
 	else {
 		// an atom of this name was not in the allAtoms list the linker gave us
-		if ( _deadllvmAtoms.find(name) != _deadllvmAtoms.end() ) {
+		auto llvmAtom = _deadllvmAtoms.find(name);
+		if ( llvmAtom != _deadllvmAtoms.end() ) {
 			// this corresponding to an atom that the linker coalesced away or marked not-live
 			if ( _options.linkerDeadStripping ) {
 				// llvm seems to want this atom and -dead_strip is enabled, so it will be deleted if not needed, so add back
-				Atom* llvmAtom = _deadllvmAtoms[name];
-				llvmAtom->setCompiledAtom(machoAtom);
+				llvmAtom->second->setCompiledAtom(machoAtom);
 				_newAtoms.push_back(&machoAtom);
-				if (log) fprintf(stderr, "AtomSyncer, mach-o atom %p matches dead lto atom %p but adding back (name=%s)\n", &machoAtom, llvmAtom, machoAtom.name());
+				if (log) fprintf(stderr, "AtomSyncer, mach-o atom %p matches dead lto atom %p but adding back (name=%s)\n", &machoAtom, llvmAtom->second, machoAtom.name());
 			}
 			else {
 				// Don't pass it back as a new atom
-				if (log) fprintf(stderr, "AtomSyncer, mach-o atom %p matches dead lto atom %p (name=%s)\n", &machoAtom, _deadllvmAtoms[name], machoAtom.name());
+				if (log) fprintf(stderr, "AtomSyncer, mach-o atom %p matches dead lto atom %p (name=%s)\n", &machoAtom, llvmAtom->second, machoAtom.name());
+				if ( llvmAtom->second->coalescedAway() ) {
+					if (log) fprintf(stderr, "AtomSyncer: dead coalesced atom %s\n", machoAtom.name());
+					// <rdar://problem/28269547>
+					// We told libLTO to keep a weak atom that will replaced by an native mach-o atom.
+					// We also need to remove any atoms directly dependent on this (FDE, LSDA).
+					for (ld::Fixup::iterator fit=machoAtom.fixupsBegin(), fend=machoAtom.fixupsEnd(); fit != fend; ++fit) {
+						switch ( fit->kind ) {
+							case ld::Fixup::kindNoneGroupSubordinate:
+							case ld::Fixup::kindNoneGroupSubordinateFDE:
+							case ld::Fixup::kindNoneGroupSubordinateLSDA:
+								assert(fit->binding == ld::Fixup::bindingDirectlyBound);
+								(const_cast<ld::Atom*>(fit->u.target))->setCoalescedAway();
+								if (log) fprintf(stderr, "AtomSyncer: mark coalesced-away subordinate atom %s\n", fit->u.target->name());
+								break;
+							default:
+								break;
+						}
+					}
+				}
 			} 
 		}
 		else
@@ -973,9 +1566,10 @@ void Parser::AtomSyncer::doAtom(const ld::Atom& machoAtom)
 			// this is something new that lto conjured up, tell ld its new
 			_newAtoms.push_back(&machoAtom);
 			// <rdar://problem/15469363> if new static atom in same section as previous non-static atom, assign to same file as previous
-			if ( (lastProxiedAtom != NULL) && (lastProxiedAtom->section() == machoAtom.section()) ) {
+			if ( (_lastProxiedAtom != NULL) && (_lastProxiedAtom->section() == machoAtom.section()) ) {
 				ld::Atom* ma = const_cast<ld::Atom*>(&machoAtom);
-				ma->setFile(lastProxiedFile);
+				ma->setFile(_lastProxiedFile);
+				if (log) fprintf(stderr, "AtomSyncer, mach-o atom %s is static and being assigned to %s\n", machoAtom.name(), _lastProxiedFile->path());
 			}
 			if (log) fprintf(stderr, "AtomSyncer, mach-o atom %p is totally new (name=%s)\n", &machoAtom, machoAtom.name());
 		}
@@ -997,9 +1591,10 @@ void Parser::AtomSyncer::doAtom(const ld::Atom& machoAtom)
 				// If mach-o atom is referencing another mach-o atom then 
 				// reference is not going through Atom proxy. Fix it here to ensure that all
 				// llvm symbol references always go through Atom proxy.
+				if ( fit->u.target->scope() != ld::Atom::scopeTranslationUnit )
 				{
-					const char* targetName = fit->u.target->name();
-					CStringToAtom::iterator post = _llvmAtoms.find(targetName);
+                    const char* targetName = fit->u.target->name();
+					CStringToAtom::const_iterator post = _llvmAtoms.find(targetName);
 					if ( post != _llvmAtoms.end() ) {
 						const ld::Atom* t = post->second;
 						if (log) fprintf(stderr, "    updating direct reference to %p to be ref to %p: %s\n", fit->u.target, t, targetName);
@@ -1007,7 +1602,8 @@ void Parser::AtomSyncer::doAtom(const ld::Atom& machoAtom)
 					}
 					else {
 						// <rdar://problem/12859831> Don't unbind follow-on reference into by-name reference 
-						if ( (_deadllvmAtoms.find(targetName) != _deadllvmAtoms.end()) && (fit->kind != ld::Fixup::kindNoneFollowOn) && (fit->u.target->scope() != ld::Atom::scopeTranslationUnit) ) {
+						auto llvmAtom = _deadllvmAtoms.find(targetName);
+						if ( (llvmAtom != _deadllvmAtoms.end()) && (fit->kind != ld::Fixup::kindNoneFollowOn) && (fit->u.target->scope() != ld::Atom::scopeTranslationUnit) ) {
 							// target was coalesed away and replace by mach-o atom from a non llvm .o file
 							fit->binding = ld::Fixup::bindingByNameUnbound;
 							fit->u.name = targetName;
@@ -1046,6 +1642,21 @@ bool isObjectFile(const uint8_t* fileContent, uint64_t fileLength, cpu_type_t ar
 	Mutex lock;
 	return Parser::validFile(fileContent, fileLength, architecture, subarch);
 }
+
+//
+// Used by archive reader to see if member defines a Category (for -ObjC semantics)
+//
+bool hasObjCCategory(const uint8_t* fileContent, uint64_t fileLength)
+{
+#if LTO_API_VERSION >= 20
+	// note: if run with older libLTO.dylib that does not implement
+	// lto_module_has_objc_category, the call will return 0 which is "false"
+	return lto_module_has_objc_category(fileContent, fileLength);
+#else
+	return false;
+#endif
+}
+
 
 static ld::relocatable::File *parseImpl(
           const uint8_t *fileContent, uint64_t fileLength, const char *path,
@@ -1090,6 +1701,27 @@ const char* version()
 	return ::lto_get_version();
 }
 
+//
+// used by "ld -v" to report static version of libLTO.dylib API being compiled
+//
+unsigned int static_api_version()
+{
+	return LTO_API_VERSION;
+}
+
+//
+// used by "ld -v" to report version of libLTO.dylib being used
+//
+
+unsigned int runtime_api_version()
+{
+// ld64-port: Added #if
+#if LTO_API_VERSION >= 17
+	return ::lto_api_version();
+#else
+	return -1;
+#endif
+}
 
 //
 // used by ld for error reporting
@@ -1127,6 +1759,212 @@ bool optimize(  const std::vector<const ld::Atom*>&	allAtoms,
 
 }; // namespace lto
 
+static const char *sLTODylib = "@rpath/libLTO.dylib";
+static std::atomic<bool> sLTOIsLoaded(false);
+
+static void *getHandle() {
+  auto impl = [&]() -> void* {
+#ifndef __APPLE__ // ld64-port
+    static char lib[PATH_MAX] = "";
+    if (char *p = getenv("LIBLTO")) {
+      strlcpy(lib, p, sizeof(lib));
+    } else {
+      strlcpy(lib, sLTODylib, sizeof(lib));
+    }
+    if (!strncmp(lib, "@rpath/", strlen("@rpath/")))
+      memmove(lib, lib + strlen("@rpath/"), strlen(lib) - strlen("@rpath/") + 1);
+    char *ext = strrchr(lib, '.');
+    if (ext && !strcmp(ext, ".dylib"))
+      strcpy(ext, ".so");
+    sLTODylib = lib;
+#endif
+    void *handle = ::dlopen(sLTODylib, RTLD_LAZY);
+#ifndef __APPLE__ // ld64-port
+    if (!handle)
+      handle = ::dlopen("libLTO.so", RTLD_LAZY);
+#endif
+    if (handle)
+      sLTOIsLoaded.store(true);
+    return handle;
+  };
+
+  // Memoize.
+  static void *handle = impl();
+  return handle;
+}
+
+namespace lto {
+void set_library(const char *dylib) {
+  assert(!sLTOIsLoaded);
+  sLTODylib = dylib;
+}
+} // end namespace lto
+
+namespace {
+template <class T> struct LTOSymbol;
+template <class R, class... Args> struct LTOSymbol<R (Args...)> {
+  R (*call)(Args...) = nullptr;
+
+public:
+  LTOSymbol() = delete;
+  LTOSymbol(const char *name) {
+    if (void *handle = getHandle())
+      call = reinterpret_cast<R (*)(Args...)>(::dlsym(handle, name));
+
+    if (!call)
+      call = [](Args...) -> R { return R{}; };
+  }
+};
+template <class... Args> struct LTOSymbol<void (Args...)> {
+  void (*call)(Args...) = nullptr;
+
+public:
+  LTOSymbol() = delete;
+  LTOSymbol(const char *name) {
+    if (void *handle = getHandle())
+      call = reinterpret_cast<void (*)(Args...)>(::dlsym(handle, name));
+
+    if (!call)
+      call = [](Args...) -> void {};
+  }
+};
+} // end namespace
+
+extern "C" {
+
+// ld64-port: Added LTO_API_VERSION checks
+
+#define WRAP_LTO_SYMBOL(RET, NAME, PARAMS, ARGS)                               \
+  RET NAME PARAMS {                                                            \
+    static LTOSymbol<RET PARAMS> x(#NAME);                                     \
+    return (x.call)ARGS;                                                       \
+  }
+
+WRAP_LTO_SYMBOL(const char *, lto_get_version, (), ())
+WRAP_LTO_SYMBOL(lto_bool_t, lto_module_has_objc_category,
+                (const void *mem, size_t length), (mem, length))
+WRAP_LTO_SYMBOL(lto_module_t, lto_module_create_from_memory_with_path,
+                (const void *mem, size_t length, const char *path),
+                (mem, length, path))
+WRAP_LTO_SYMBOL(lto_module_t, lto_module_create_in_local_context,
+                (const void *mem, size_t length, const char *path),
+                (mem, length, path))
+WRAP_LTO_SYMBOL(lto_module_t, lto_module_create_from_memory,
+                (const void *mem, size_t length), (mem, length))
+WRAP_LTO_SYMBOL(void, lto_module_dispose, (lto_module_t mod), (mod))
+WRAP_LTO_SYMBOL(unsigned int, lto_module_get_num_symbols, (lto_module_t mod),
+                (mod))
+WRAP_LTO_SYMBOL(const char *, lto_module_get_symbol_name,
+                (lto_module_t mod, unsigned int index), (mod, index))
+WRAP_LTO_SYMBOL(lto_symbol_attributes, lto_module_get_symbol_attribute,
+                (lto_module_t mod, unsigned int index), (mod, index))
+WRAP_LTO_SYMBOL(lto_bool_t, lto_codegen_add_module,
+                (lto_code_gen_t cg, lto_module_t mod), (cg, mod))
+#if LTO_API_VERSION >= 18
+WRAP_LTO_SYMBOL(lto_bool_t, lto_module_is_thinlto, (lto_module_t mod), (mod))
+#endif
+
+WRAP_LTO_SYMBOL(void, lto_codegen_set_module,
+                (lto_code_gen_t cg, lto_module_t mod), (cg, mod))
+#if LTO_API_VERSION >= 18
+WRAP_LTO_SYMBOL(void, thinlto_codegen_add_module,
+                (thinlto_code_gen_t cg, const char *identifier,
+                 const char *data, int length),
+                (cg, identifier, data, length))
+
+WRAP_LTO_SYMBOL(void, thinlto_codegen_add_must_preserve_symbol,
+                (thinlto_code_gen_t cg, const char *name, int length),
+                (cg, name, length))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_add_cross_referenced_symbol,
+                (thinlto_code_gen_t cg, const char *name, int length),
+                (cg, name, length))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_set_cache_dir,
+                (thinlto_code_gen_t cg, const char *cache_dir), (cg, cache_dir))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_set_cache_pruning_interval,
+                (thinlto_code_gen_t cg, int interval), (cg, interval))
+WRAP_LTO_SYMBOL(
+    void, thinlto_codegen_set_final_cache_size_relative_to_available_space,
+    (thinlto_code_gen_t cg, unsigned percentage), (cg, percentage))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_set_cache_entry_expiration,
+                (thinlto_code_gen_t cg, unsigned expiration), (cg, expiration))
+
+WRAP_LTO_SYMBOL(void, thinlto_codegen_process, (thinlto_code_gen_t cg), (cg))
+WRAP_LTO_SYMBOL(unsigned int, thinlto_module_get_num_objects,
+                (thinlto_code_gen_t cg), (cg))
+WRAP_LTO_SYMBOL(LTOObjectBuffer, thinlto_module_get_object,
+                (thinlto_code_gen_t cg, unsigned int index), (cg, index))
+WRAP_LTO_SYMBOL(unsigned int, thinlto_module_get_num_object_files,
+                (thinlto_code_gen_t cg), (cg))
+WRAP_LTO_SYMBOL(const char *, thinlto_module_get_object_file,
+                (thinlto_code_gen_t cg, unsigned int index), (cg, index))
+WRAP_LTO_SYMBOL(lto_bool_t, thinlto_codegen_set_pic_model,
+                (thinlto_code_gen_t cg, lto_codegen_model m), (cg, m))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_set_savetemps_dir,
+                (thinlto_code_gen_t cg, const char *save_temps_dir),
+                (cg, save_temps_dir))
+WRAP_LTO_SYMBOL(void, thinlto_set_generated_objects_dir,
+                (thinlto_code_gen_t cg, const char *save_temps_dir),
+                (cg, save_temps_dir))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_set_cpu,
+                (thinlto_code_gen_t cg, const char *cpu), (cg, cpu))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_disable_codegen,
+                (thinlto_code_gen_t cg, lto_bool_t disable), (cg, disable))
+WRAP_LTO_SYMBOL(void, thinlto_codegen_set_codegen_only,
+                (thinlto_code_gen_t cg, lto_bool_t codegen_only),
+                (cg, codegen_only))
+WRAP_LTO_SYMBOL(void, thinlto_debug_options,
+                (const char *const *options, int number), (options, number))
+#endif // LTO_API_VERSION >= 18
+
+WRAP_LTO_SYMBOL(lto_code_gen_t, lto_codegen_create_in_local_context, (void), ())
+#if LTO_API_VERSION >= 7
+WRAP_LTO_SYMBOL(void, lto_codegen_set_diagnostic_handler,
+                (lto_code_gen_t cg, lto_diagnostic_handler_t handler,
+                 void *context),
+                (cg, handler, context))
+#endif // LTO_API_VERSION >= 7
+WRAP_LTO_SYMBOL(lto_code_gen_t, lto_codegen_create, (void), ())
+WRAP_LTO_SYMBOL(void, lto_codegen_debug_options,
+                (lto_code_gen_t cg, const char *options), (cg, options))
+WRAP_LTO_SYMBOL(void, lto_codegen_dispose, (lto_code_gen_t cg), (cg))
+WRAP_LTO_SYMBOL(void, lto_codegen_set_assembler_path,
+                (lto_code_gen_t cg, const char *path), (cg, path))
+#if LTO_API_VERSION >= 18
+WRAP_LTO_SYMBOL(thinlto_code_gen_t, thinlto_create_codegen, (void), ())
+#endif // LTO_API_VERSION >= 18
+WRAP_LTO_SYMBOL(unsigned int, lto_api_version, (void), ())
+WRAP_LTO_SYMBOL(const void *, lto_codegen_compile_optimized,
+                (lto_code_gen_t cg, size_t *length), (cg, length))
+WRAP_LTO_SYMBOL(lto_bool_t, lto_module_is_object_file_in_memory_for_target,
+                (const void *mem, size_t length,
+                 const char *target_triple_prefix),
+                (mem, length, target_triple_prefix))
+WRAP_LTO_SYMBOL(void, lto_codegen_set_should_embed_uselists,
+                (lto_code_gen_t cg, lto_bool_t ShouldEmbedUselists),
+                (cg, ShouldEmbedUselists))
+WRAP_LTO_SYMBOL(const void *, lto_codegen_compile,
+                (lto_code_gen_t cg, size_t *length), (cg, length))
+WRAP_LTO_SYMBOL(const char *, lto_get_error_message, (void), ())
+WRAP_LTO_SYMBOL(lto_module_t, lto_module_create_in_codegen_context,
+                (const void *mem, size_t length, const char *path,
+                 lto_code_gen_t cg),
+                (mem, length, path, cg))
+WRAP_LTO_SYMBOL(lto_bool_t, lto_codegen_optimize, (lto_code_gen_t cg), (cg))
+WRAP_LTO_SYMBOL(lto_bool_t, lto_codegen_write_merged_modules,
+                (lto_code_gen_t cg, const char *path), (cg, path))
+WRAP_LTO_SYMBOL(void, lto_codegen_set_should_internalize,
+                (lto_code_gen_t cg, lto_bool_t ShouldInternalize),
+                (cg, ShouldInternalize))
+WRAP_LTO_SYMBOL(void, lto_codegen_set_cpu, (lto_code_gen_t cg, const char *cpu),
+                (cg, cpu))
+WRAP_LTO_SYMBOL(lto_bool_t, lto_codegen_set_pic_model,
+                (lto_code_gen_t cg, lto_codegen_model model), (cg, model))
+WRAP_LTO_SYMBOL(void, lto_codegen_add_must_preserve_symbol,
+                (lto_code_gen_t cg, const char *symbol), (cg, symbol))
+
+#undef WRAP_LTO_SYMBOL
+
+} // end extern "C"
 
 #endif
 

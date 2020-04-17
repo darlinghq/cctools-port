@@ -153,7 +153,14 @@ struct ofile *ofile)
 		arch = new_arch(archs, narchs);
 		arch->file_name = savestr(filename);
 		arch->type = ofile->arch_type;
-		arch->fat_arch = ofile->fat_archs + ofile->narch;
+		if(ofile->fat_header->magic == FAT_MAGIC_64){
+		    arch->fat_arch64 = ofile->fat_archs64 + ofile->narch;
+		    arch->fat_arch = NULL;
+		}
+		else{
+		    arch->fat_arch = ofile->fat_archs + ofile->narch;
+		    arch->fat_arch64 = NULL;
+		}
 		arch->fat_arch_name = savestr(ofile->arch_flag.name);
 
 		if(ofile->arch_type == OFILE_ARCHIVE){
@@ -176,15 +183,29 @@ struct ofile *ofile)
 #ifdef LTO_SUPPORT
 		else if(ofile->arch_type == OFILE_LLVM_BITCODE){
 		    arch->lto = ofile->lto;
-		    arch->unknown_addr = ofile->file_addr +
-					 arch->fat_arch->offset;
-		    arch->unknown_size = arch->fat_arch->size;
+		    if(ofile->fat_header->magic == FAT_MAGIC_64){
+			arch->unknown_addr = ofile->file_addr +
+					     arch->fat_arch64->offset;
+			arch->unknown_size = arch->fat_arch64->size;
+		    }
+		    else{
+			arch->unknown_addr = ofile->file_addr +
+					     arch->fat_arch->offset;
+			arch->unknown_size = arch->fat_arch->size;
+		    }
 		}
 #endif /* LTO_SUPPORT */
 		else{ /* ofile->arch_type == OFILE_UNKNOWN */
-		    arch->unknown_addr = ofile->file_addr +
-					 arch->fat_arch->offset;
-		    arch->unknown_size = arch->fat_arch->size;
+		    if(ofile->fat_header->magic == FAT_MAGIC_64){
+			arch->unknown_addr = ofile->file_addr +
+					     arch->fat_arch64->offset;
+			arch->unknown_size = arch->fat_arch64->size;
+		    }
+		    else{
+			arch->unknown_addr = ofile->file_addr +
+					     arch->fat_arch->offset;
+			arch->unknown_size = arch->fat_arch->size;
+		    }
 		}
 	    }while(ofile_next_arch(ofile) == TRUE);
 	}
@@ -246,7 +267,7 @@ struct ofile *ofile)
     struct member *member;
     enum bool flag;
     struct ar_hdr *ar_hdr;
-    uint32_t size, ar_name_size;
+    uint64_t size, ar_name_size;
     char ar_name_buf[sizeof(ofile->member_ar_hdr->ar_name) + 1];
     char ar_size_buf[sizeof(ofile->member_ar_hdr->ar_size) + 1];
 
@@ -301,7 +322,7 @@ struct ofile *ofile)
 		    if(ofile->member_name[ar_name_size - 1] != '\0')
 		       break;
 		}
-		member->member_name_size = ar_name_size;
+		member->member_name_size = (uint32_t)ar_name_size;
 		ar_name_size = rnd(ar_name_size, 8) +
 			       (rnd(sizeof(struct ar_hdr), 8) -
 				sizeof(struct ar_hdr));

@@ -1,4 +1,7 @@
-const char ldVersionString[] = "264.3.102\n";
+#define VAL(x) #x
+#define STRINGIFY(x) VAL(x)
+
+const char ldVersionString[] = "@(#)PROGRAM:ld  PROJECT:ld64-" STRINGIFY(LD64_VERSION_NUM) "\n";
 
 #ifndef __APPLE__
 
@@ -36,8 +39,12 @@ void __assert_rtn(const char *func, const char *file, int line, const char *msg)
     __assert(msg, file, line, func);
 #elif defined(__NetBSD__) || defined(__OpenBSD__) || defined(__CYGWIN__)
     __assert(msg, line, file);
-#else
+#elif defined(__GLIBC__) || defined(__MINGW32__)
     __assert(msg, file, line);
+#else
+    fprintf(stderr, "Assertion failed: %s (%s: %s: %d)\n", msg, file, func, line);
+    fflush(NULL);
+    abort();
 #endif /* __FreeBSD__ */
 }
 

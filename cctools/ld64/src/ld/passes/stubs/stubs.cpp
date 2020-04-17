@@ -56,6 +56,7 @@ public:
 	Atom*						compressedHelperHelper;
 	Atom*						compressedImageCache;
 	Atom*						compressedFastBinderPointer;
+	const bool					usingDataConstSegment;
 
 private:
 
@@ -75,7 +76,6 @@ private:
 	const cpu_type_t			_architecture;
 	const bool					_lazyDylibsInUuse;
 	const bool					_compressedLINKEDIT;
-	const bool					_prebind;
 	const bool					_mightBeInSharedRegion;
 	const bool					_pic;
 	const bool					_flatNamespace;
@@ -93,16 +93,22 @@ private:
 #if SUPPORT_ARCH_arm64
 #include "stub_arm64.hpp"
 #endif
+#if SUPPORT_ARCH_arm64e
+#include "stub_arm64e.hpp"
+#endif
+#if SUPPORT_ARCH_arm64_32
+#include "stub_arm64_32.hpp"
+#endif
 
 Pass::Pass(const Options& opts) 
 	:	compressedHelperHelper(NULL), 
 		compressedImageCache(NULL),
 		compressedFastBinderPointer(NULL),
+		usingDataConstSegment(opts.useDataConstSegment()),
 		_options(opts),
 		_architecture(opts.architecture()),
 		_lazyDylibsInUuse(opts.usingLazyDylibLinking()),
 		_compressedLINKEDIT(opts.makeCompressedDyldInfo()),
-		_prebind(opts.prebind()),
 		_mightBeInSharedRegion(opts.sharedRegionEligible()), 
 		_pic(opts.outputSlidable()),
 		_flatNamespace(opts.nameSpace() != Options::kTwoLevelNameSpace),
@@ -154,7 +160,7 @@ const ld::Atom* Pass::stubableFixup(const ld::Fixup* fixup, ld::Internal& state)
 				}
 				break;
 			default:
-				if ( target->contentType() == ld::Atom::typeResolver ) {
+				if ( (target != NULL) && (target->contentType() == ld::Atom::typeResolver) ) {
 					// any pointer to a resolver needs to change to pointer to stub
 					return target;
 				}
@@ -178,8 +184,8 @@ ld::Atom* Pass::makeStub(const ld::Atom& target, bool weakImport)
 	if ( (dylib != NULL) && dylib->willBeLazyLoadedDylib() ) 
 		forLazyDylib = true;
 	bool stubToResolver = (target.contentType() == ld::Atom::typeResolver);
-#if SUPPORT_ARCH_arm_any || SUPPORT_ARCH_arm64
-	bool usingDataConst =  _options.useDataConstSegment();
+#if SUPPORT_ARCH_arm_any || SUPPORT_ARCH_arm64 || SUPPORT_ARCH_arm64e
+	bool usingDataConst =  _options.useDataConstSegment() && _options.sharedRegionEligible();
 #endif
 
 	if ( usingCompressedLINKEDIT() && !forLazyDylib ) {
@@ -190,7 +196,11 @@ ld::Atom* Pass::makeStub(const ld::Atom& target, bool weakImport)
 	switch ( _architecture ) {
 #if SUPPORT_ARCH_i386
 		case CPU_TYPE_I386:
-			if ( usingCompressedLINKEDIT() && !forLazyDylib )
+			if ( usingCompressedLINKEDIT() && !forLazyDylib && _options.noLazyBinding() && !stubToResolver )
+				return new ld::passes::stubs::x86::NonLazyStubAtom(*this, target, weakImport);
+			else if ( _options.makeChainedFixups() && !stubToResolver )
+				return new ld::passes::stubs::x86::NonLazyStubAtom(*this, target, weakImport);
+			else if ( usingCompressedLINKEDIT() && !forLazyDylib )
 				return new ld::passes::stubs::x86::StubAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport);
 			else
 				return new ld::passes::stubs::x86::classic::StubAtom(*this, target, forLazyDylib, weakImport);
@@ -198,23 +208,43 @@ ld::Atom* Pass::makeStub(const ld::Atom& target, bool weakImport)
 #endif
 #if SUPPORT_ARCH_x86_64
 		case CPU_TYPE_X86_64:
-			if ( (_options.outputKind() == Options::kKextBundle) && _options.kextsUseStubs() ) 
-				return new ld::passes::stubs::x86_64::KextStubAtom(*this, target);
-			else if ( usingCompressedLINKEDIT() && !forLazyDylib )
-				return new ld::passes::stubs::x86_64::StubAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport);
+			if ( (_options.outputKind() == Options::kKextBundle) && _options.kextsUseStubs() )
+				return new ld::passes::stubs::x86_64::NonLazyStubAtom(*this, target, weakImport);
+			else if ( _options.makeChainedFixups() ) {
+				if ( stubToResolver )
+					return new ld::passes::stubs::x86_64::StubAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport);
+				else
+					return new ld::passes::stubs::x86_64::NonLazyStubAtom(*this, target, weakImport);
+			}
+			else if ( usingCompressedLINKEDIT() ) {
+				if ( forLazyDylib )
+					return new ld::passes::stubs::x86_64::classic::StubAtom(*this, target, stubToGlobalWeakDef, weakImport);
+				else if ( _options.noLazyBinding() && !stubToResolver )
+					return new ld::passes::stubs::x86_64::NonLazyStubAtom(*this, target, weakImport);
+				else
+					return new ld::passes::stubs::x86_64::StubAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport);
+			}
 			else
-				return new ld::passes::stubs::x86_64::classic::StubAtom(*this, target, forLazyDylib, weakImport);
+				return new ld::passes::stubs::x86_64::classic::StubAtom(*this, target, stubToGlobalWeakDef, weakImport);
 			break;
 #endif
 #if SUPPORT_ARCH_arm_any
 		case CPU_TYPE_ARM: 
 			if ( (_options.outputKind() == Options::kKextBundle) && _options.kextsUseStubs() ) {
 				// if text relocs are not allows in kext bundles, then linker must create a stub 
-				return new ld::passes::stubs::arm::StubPICKextAtom(*this, target);
+				return new ld::passes::stubs::arm::StubPICKextAtom(*this, target, weakImport);
+			}
+			else if ( _options.makeChainedFixups() ) {
+				if ( stubToResolver )
+					return new ld::passes::stubs::arm::StubPICAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport, usingDataConst);
+				else
+					return new ld::passes::stubs::arm::NonLazyStubPICAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport, usingDataConst);
 			}
 			else if ( usingCompressedLINKEDIT() && !forLazyDylib ) {
-				if ( (_stubCount < 900) && !_mightBeInSharedRegion && !_largeText )
+				if ( (_stubCount < 900) && !_mightBeInSharedRegion && !_largeText && !_options.makeEncryptable() )
 					return new ld::passes::stubs::arm::StubCloseAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport);
+				else if ( usingCompressedLINKEDIT() && !forLazyDylib && _options.noLazyBinding() && !stubToResolver)
+					return new ld::passes::stubs::arm::StubPICKextAtom(*this, target, weakImport);
 				else if ( _pic )
 					return new ld::passes::stubs::arm::StubPICAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport, usingDataConst);
 				else
@@ -230,8 +260,25 @@ ld::Atom* Pass::makeStub(const ld::Atom& target, bool weakImport)
 #endif
 #if SUPPORT_ARCH_arm64
 		case CPU_TYPE_ARM64:
-			if ( (_options.outputKind() == Options::kKextBundle) && _options.kextsUseStubs() ) 
-				return new ld::passes::stubs::arm64::KextStubAtom(*this, target);
+#if SUPPORT_ARCH_arm64e
+			if ( (_options.subArchitecture() == CPU_SUBTYPE_ARM64E) && _options.useAuthenticatedStubs() ) {
+				if ( (_options.outputKind() == Options::kKextBundle) && _options.kextsUseStubs() )
+					return new ld::passes::stubs::arm64e::NonLazyStubAtom(*this, target, weakImport);
+				else if ( usingCompressedLINKEDIT() && !forLazyDylib && _options.noLazyBinding() && !stubToResolver )
+					return new ld::passes::stubs::arm64e::NonLazyStubAtom(*this, target, weakImport);
+				else if ( _options.makeChainedFixups() && !stubToResolver )
+					return new ld::passes::stubs::arm64e::NonLazyStubAtom(*this, target, weakImport);
+				else
+					return new ld::passes::stubs::arm64e::StubAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport, usingDataConst);
+				break;
+			}
+#endif
+			if ( (_options.outputKind() == Options::kKextBundle) && _options.kextsUseStubs() )
+				return new ld::passes::stubs::arm64::NonLazyStubAtom(*this, target, weakImport);
+			else if ( usingCompressedLINKEDIT() && !forLazyDylib && _options.noLazyBinding() && !stubToResolver )
+				return new ld::passes::stubs::arm64::NonLazyStubAtom(*this, target, weakImport);
+			else if ( _options.makeChainedFixups() && !stubToResolver )
+				return new ld::passes::stubs::arm64::NonLazyStubAtom(*this, target, weakImport);
 			else
 				return new ld::passes::stubs::arm64::StubAtom(*this, target, stubToGlobalWeakDef, stubToResolver, weakImport, usingDataConst);
 			break;
@@ -330,7 +377,7 @@ void Pass::process(ld::Internal& state)
 			if ( atom->contentType() == ld::Atom::typeResolver ) {
 				if ( _options.outputKind() != Options::kDynamicLibrary ) 
 					throwf("resolver functions (%s) can only be used in dylibs", atom->name());
-				if ( !_options.makeCompressedDyldInfo() ) {
+				if ( !_options.makeCompressedDyldInfo() && !_options.makeChainedFixups() ) {
 					if ( _options.architecture() == CPU_TYPE_ARM )
 						throwf("resolver functions (%s) can only be used when targeting iOS 4.2 or later", atom->name());
 					else
@@ -357,7 +404,7 @@ void Pass::process(ld::Internal& state)
 		return;
 	
 	// <rdar://problem/8553283> lazily check for helper
-	if ( !_options.makeCompressedDyldInfo() && (state.classicBindingHelper == NULL) && (_options.outputKind() != Options::kKextBundle) ) 
+	if ( !_options.makeCompressedDyldInfo() && !_options.makeThreadedStartsSection() && !_options.makeChainedFixups() && (state.classicBindingHelper == NULL) && (_options.outputKind() != Options::kKextBundle) )
 		throw "symbol dyld_stub_binding_helper not found, normally in crt1.o/dylib1.o/bundle1.o";
 
 	// disable arm close stubs in some cases

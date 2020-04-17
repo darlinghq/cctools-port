@@ -123,35 +123,33 @@ template <typename A>
 class File : public ld::dylib::File
 {
 public:
-	File(const char* path, time_t mTime, ld::File::Ordinal ordinal, Options::Platform platform,
-		 uint32_t linkMinOSVersion, bool linkingFlatNamespace, bool hoistImplicitPublicDylibs,
+	File(const char* path, time_t mTime, ld::File::Ordinal ordinal, const ld::VersionSet& platforms,
+		 bool allowWeakImports, bool linkingFlatNamespace, bool hoistImplicitPublicDylibs,
 		 bool allowSimToMacOSX, bool addVers);
 
 	// overrides of ld::File
 	virtual bool							forEachAtom(ld::File::AtomHandler&) const override final;
 	virtual bool							justInTimeforEachAtom(const char* name, ld::File::AtomHandler&) const override final;
-	virtual ld::File::ObjcConstraint		objCConstraint() const override final { return _objcConstraint; }
 	virtual uint8_t							swiftVersion() const override final { return _swiftVersion; }
-	virtual uint32_t						minOSVersion() const override final { return _minVersionInDylib; }
-	virtual uint32_t						platformLoadCommand() const	override final { return _platformInDylib; }
 	virtual ld::Bitcode*					getBitcode() const override final { return _bitcode.get(); }
 
 
 	// overrides of ld::dylib::File
-	virtual void							processIndirectLibraries(ld::dylib::File::DylibHandler*, bool addImplicitDylibs) override final;
+	virtual void							processIndirectLibraries(ld::dylib::File::DylibHandler*, bool addImplicitDylibs) override;
 	virtual bool							providedExportAtom() const	override final { return _providedAtom; }
 	virtual const char*						parentUmbrella() const override final { return _parentUmbrella; }
 	virtual const std::vector<const char*>*	allowableClients() const override final { return _allowableClients.empty() ? nullptr : &_allowableClients; }
+    virtual const std::vector<const char*>&	rpaths() const override final { return _rpaths; }
 	virtual bool							hasWeakExternals() const override final	{ return _hasWeakExports; }
 	virtual bool							deadStrippable() const override final { return _deadStrippable; }
 	virtual bool							hasWeakDefinition(const char* name) const override final;
+    virtual bool                            hasDefinition(const char* name) const override final;
 	virtual bool							hasPublicInstallName() const override final { return _hasPublicInstallName; }
 	virtual bool							allSymbolsAreWeakImported() const override final;
 	virtual bool							installPathVersionSpecific() const override final { return _installPathOverride; }
 	virtual bool							appExtensionSafe() const override final	{ return _appExtensionSafe; };
+    virtual void                            forEachExportedSymbol(void (^handler)(const char* symbolName, bool weakDef)) const override;
 
-
-	bool									wrongOS() const { return _wrongOS; }
 
 private:
 	using pint_t = typename A::P::uint_t;
@@ -185,12 +183,12 @@ private:
 	using NameSet = std::unordered_set<const char*, CStringHash, ld::CStringEquals>;
 
 	std::pair<bool, bool>		hasWeakDefinitionImpl(const char* name) const;
+    bool                        hasDefinitionImpl(const char* name) const;
 	bool						containsOrReExports(const char* name, bool& weakDef, bool& tlv, pint_t& addr) const;
 	void						assertNoReExportCycles(ReExportChain*) const;
 
 protected:
 	bool						isPublicLocation(const char* path) const;
-	void						addSymbol(const char* name, bool weak = false, bool tlv = false, pint_t address = 0);
 
 private:
 	ld::Section							_importProxySection;
@@ -204,15 +202,11 @@ protected:
 	std::vector<Dependent>				_dependentDylibs;
 	ImportAtom<A>*						_importAtom;
 	std::vector<const char*>   			_allowableClients;
+	std::vector<const char*>   			_rpaths;
 	const char*							_parentUmbrella;
 	std::unique_ptr<ld::Bitcode>		_bitcode;
-	const Options::Platform				_platform;
-	ld::File::ObjcConstraint			_objcConstraint;
-	const uint32_t						_linkMinOSVersion;
-	uint32_t							_minVersionInDylib;
-	uint32_t							_platformInDylib;
+	ld::VersionSet                      _platforms;
 	uint8_t								_swiftVersion;
-	bool								_wrongOS;
 	bool								_linkingFlat;
 	bool								_noRexports;
 	bool								_explictReExportFound;
@@ -222,7 +216,7 @@ protected:
 	bool								_deadStrippable;
 	bool								_hasPublicInstallName;
 	bool								_appExtensionSafe;
-
+  const bool              _allowWeakImports;
 	const bool							_allowSimToMacOSXLinking;
 	const bool							_addVersionLoadCommand;
 
@@ -233,8 +227,8 @@ template <typename A>
 bool File<A>::_s_logHashtable = false;
 
 template <typename A>
-File<A>::File(const char* path, time_t mTime, ld::File::Ordinal ord,  Options::Platform platform,
-			  uint32_t linkMinOSVersion, bool linkingFlatNamespace,
+File<A>::File(const char* path, time_t mTime, ld::File::Ordinal ord, const ld::VersionSet& platforms,
+			  bool allowWeakImports, bool linkingFlatNamespace,
 			  bool hoistImplicitPublicDylibs,
 			  bool allowSimToMacOSX, bool addVers)
 	: ld::dylib::File(path, mTime, ord),
@@ -244,13 +238,8 @@ File<A>::File(const char* path, time_t mTime, ld::File::Ordinal ord,  Options::P
 	  _indirectDylibsProcessed(false),
 	  _importAtom(nullptr),
 	  _parentUmbrella(nullptr),
-	  _platform(platform),
-	  _objcConstraint(ld::File::objcConstraintNone),
-	  _linkMinOSVersion(linkMinOSVersion),
-	  _minVersionInDylib(0),
-	  _platformInDylib(Options::kPlatformUnknown),
+    _platforms(platforms),
 	  _swiftVersion(0),
-	  _wrongOS(false),
 	  _linkingFlat(linkingFlatNamespace),
 	  _noRexports(false),
 	  _explictReExportFound(false),
@@ -260,6 +249,7 @@ File<A>::File(const char* path, time_t mTime, ld::File::Ordinal ord,  Options::P
 	  _deadStrippable(false),
 	  _hasPublicInstallName(false),
 	  _appExtensionSafe(false),
+    _allowWeakImports(allowWeakImports),
 	  _allowSimToMacOSXLinking(allowSimToMacOSX),
 	  _addVersionLoadCommand(addVers)
 {
@@ -284,6 +274,23 @@ std::pair<bool, bool> File<A>::hasWeakDefinitionImpl(const char* name) const
 }
 
 template <typename A>
+bool File<A>::hasDefinitionImpl(const char* name) const
+{
+    const auto pos = _atoms.find(name);
+    if ( pos != this->_atoms.end() )
+        return true;
+
+    // look in re-exported libraries.
+    for (const auto &dep : _dependentDylibs) {
+        if ( dep.reExport ) {
+            if ( dep.dylib->hasDefinitionImpl(name) )
+                return true;
+        }
+    }
+    return false;
+}
+
+template <typename A>
 bool File<A>::hasWeakDefinition(const char* name) const
 {
 	// If we are supposed to ignore this export, then pretend we don't have it.
@@ -291,6 +298,16 @@ bool File<A>::hasWeakDefinition(const char* name) const
 		return false;
 
 	return hasWeakDefinitionImpl(name).second;
+}
+
+template <typename A>
+bool File<A>::hasDefinition(const char* name) const
+{
+    // If we are supposed to ignore this export, then pretend we don't have it.
+    if ( _ignoreExports.count(name) != 0 )
+        return false;
+
+    return hasDefinitionImpl(name);
 }
 
 template <typename A>
@@ -357,6 +374,14 @@ bool File<A>::justInTimeforEachAtom(const char* name, ld::File::AtomHandler& han
 }
 
 template <typename A>
+void File<A>::forEachExportedSymbol(void (^handler)(const char* symbolName, bool weakDef)) const
+{
+    for (const auto& entry : _atoms) {
+        handler(entry.first, entry.second.weakDef);
+    }
+}
+
+template <typename A>
 void File<A>::assertNoReExportCycles(ReExportChain* prev) const
 {
 	// recursively check my re-exported dylibs
@@ -388,7 +413,7 @@ void File<A>::processIndirectLibraries(ld::dylib::File::DylibHandler* handler, b
 		fprintf(stderr, "processIndirectLibraries(%s)\n", this->installPath());
 	if ( _linkingFlat ) {
 		for (auto &dep : _dependentDylibs)
-			dep.dylib = (File<A>*)handler->findDylib(dep.path, this->path());
+			dep.dylib = (File<A>*)handler->findDylib(dep.path, this, false);
 	}
 	else if ( _noRexports ) {
 		// MH_NO_REEXPORTED_DYLIBS bit set, then nothing to do
@@ -400,8 +425,8 @@ void File<A>::processIndirectLibraries(ld::dylib::File::DylibHandler* handler, b
 				if ( log )
 					fprintf(stderr, "processIndirectLibraries() parent=%s, child=%s\n", this->installPath(), dep.path);
 				// a LC_REEXPORT_DYLIB, LC_SUB_UMBRELLA or LC_SUB_LIBRARY says we re-export this child
-				dep.dylib = (File<A>*)handler->findDylib(dep.path, this->path());
-				if ( dep.dylib->hasPublicInstallName() && !dep.dylib->wrongOS() ) {
+				dep.dylib = (File<A>*)handler->findDylib(dep.path, this, this->speculativelyLoaded());
+				if ( dep.dylib->hasPublicInstallName() ) {
 					// promote this child to be automatically added as a direct dependent if this already is
 					if ( (this->explicitlyLinked() || this->implicitlyLinked()) && (strcmp(dep.path, dep.dylib->installPath()) == 0) ) {
 						if ( log )
@@ -425,7 +450,7 @@ void File<A>::processIndirectLibraries(ld::dylib::File::DylibHandler* handler, b
 			}
 			else if ( !_explictReExportFound ) {
 				// see if child contains LC_SUB_FRAMEWORK with my name
-				dep.dylib = (File<A>*)handler->findDylib(dep.path, this->path());
+				dep.dylib = (File<A>*)handler->findDylib(dep.path, this, this->speculativelyLoaded());
 				const char* parentUmbrellaName = dep.dylib->parentUmbrella();
 				if ( parentUmbrellaName != nullptr ) {
 					const char* parentName = this->path();
@@ -475,64 +500,6 @@ bool File<A>::isPublicLocation(const char* path) const
 	}
 	
 	return false;
-}
-
-template <typename A>
-void File<A>::addSymbol(const char* name, bool weakDef, bool tlv, pint_t address)
-{
-	// symbols that start with $ld$ are meta-data to the static linker
-	// <rdar://problem/5182537> need way for ld and dyld to see different exported symbols in a dylib
-	if ( strncmp(name, "$ld$", 4) == 0 ) {
-		//    $ld$ <action> $ <condition> $ <symbol-name>
-		const char* symAction = &name[4];
-		const char* symCond = strchr(symAction, '$');
-		if ( symCond != nullptr ) {
-			char curOSVers[16];
-			sprintf(curOSVers, "$os%d.%d$", (_linkMinOSVersion >> 16), ((_linkMinOSVersion >> 8) & 0xFF));
-			if ( strncmp(symCond, curOSVers, strlen(curOSVers)) == 0 ) {
-				const char* symName = strchr(&symCond[1], '$');
-				if ( symName != nullptr ) {
-					++symName;
-					if ( strncmp(symAction, "hide$", 5) == 0 ) {
-						if ( _s_logHashtable )
-							fprintf(stderr, "  adding %s to ignore set for %s\n", symName, this->path());
-						_ignoreExports.insert(strdup(symName));
-						return;
-					}
-					else if ( strncmp(symAction, "add$", 4) == 0 ) {
-						this->addSymbol(symName, weakDef);
-						return;
-					}
-					else if ( strncmp(symAction, "install_name$", 13) == 0 ) {
-						_dylibInstallPath = strdup(symName);
-						_installPathOverride = true;
-						// <rdar://problem/14448206> CoreGraphics redirects to ApplicationServices, but with wrong compat version
-						if ( strcmp(_dylibInstallPath, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices") == 0 )
-							_dylibCompatibilityVersion = Options::parseVersionNumber32("1.0");
-						return;
-					}
-					else if ( strncmp(symAction, "compatibility_version$", 22) == 0 ) {
-						_dylibCompatibilityVersion = Options::parseVersionNumber32(symName);
-						return;
-					}
-					else {
-						warning("bad symbol action: %s in dylib %s", name, this->path());
-					}
-				}
-			}
-		}
-		else {
-			warning("bad symbol condition: %s in dylib %s", name, this->path());
-		}
-	}
-
-	// add symbol as possible export if we are not supposed to ignore it
-	if ( _ignoreExports.count(name) == 0 ) {
-		AtomAndWeak bucket = { nullptr, weakDef, tlv, address };
-		if ( this->_s_logHashtable )
-			fprintf(stderr, "  adding %s to hash table for %s\n", name, this->path());
-		_atoms[strdup(name)] = bucket;
-	}
 }
 
 // <rdar://problem/5529626> If only weak_import symbols are used, linker should use LD_LOAD_WEAK_DYLIB

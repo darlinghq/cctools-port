@@ -18,6 +18,7 @@ along with GAS; see the file COPYING.  If not, write to
 the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.  */
 
 #include <string.h>
+#include <stdint.h> /* cctools-port: for intptr_t */
 #include "as.h"
 #include "sections.h"
 #include "obstack.h"
@@ -67,7 +68,7 @@ unsigned int nchars)
     }
     if ((int)(obstack_room(&frags)) < nchars) {
 	unsigned int n,oldn;
-	int32_t oldc;
+	size_t oldc;
 
 	frag_wane (frag_now);
 	frag_new (0);
@@ -113,14 +114,16 @@ int old_frags_var_max_size)	/* Number of chars (already allocated on obstack
     register    frchainS * frchP;
     int32_t	tmp;		/* JF */
 
+
     if(frags.chunk_size == 0){
        know(flagseen['n']);
        as_fatal("with -n a section directive must be seen before assembly "
 		"can begin");
     }
-
-    frag_now->fr_fix = (char *) (obstack_next_free (&frags)) -
-    (frag_now->fr_literal) - old_frags_var_max_size;
+    /* cctools-port: Added (intptr_t) cast to silence warning */
+    frag_now->fr_fix = (int)(intptr_t)((char *) (obstack_next_free (&frags)) -
+			     (long)(frag_now->fr_literal) -
+			     old_frags_var_max_size);
  /* Fix up old frag's fr_fix. */
 
     (void)obstack_finish (&frags);
@@ -132,7 +135,7 @@ int old_frags_var_max_size)	/* Number of chars (already allocated on obstack
     former_last_fragP = frchP->frch_last;
     know (former_last_fragP);
     know (former_last_fragP == frag_now);
-    obstack_blank (&frags, SIZEOF_STRUCT_FRAG);
+    obstack_blank (&frags, (int)SIZEOF_STRUCT_FRAG);
  /* We expect this will begin at a correct */
  /* boundary for a struct. */
     tmp=obstack_alignment_mask(&frags);

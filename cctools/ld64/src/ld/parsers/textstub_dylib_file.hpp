@@ -25,6 +25,8 @@
 #ifndef __TEXTSTUB_DYLIB_FILE_H__
 #define __TEXTSTUB_DYLIB_FILE_H__
 
+#ifdef TAPI_SUPPORT
+
 #include "ld.hpp"
 #include "Options.h"
 
@@ -36,8 +38,14 @@ extern ld::dylib::File* parse(const uint8_t* fileContent, uint64_t fileLength, c
 							  time_t modTime, const Options& opts, ld::File::Ordinal ordinal,
 							  bool bundleLoader, bool indirectDylib);
 
+extern ld::dylib::File *parse(const char *path, tapi::LinkerInterfaceFile* file, time_t modTime,
+                              ld::File::Ordinal ordinal, const Options& opts, bool indirectDylib);
+
+extern bool isTextStubFile(const uint8_t* fileContent, uint64_t fileLength, const char* path);
+
 } // namespace dylib
 } // namespace textstub
 
+#endif /* TAPI_SUPPORT */
 
 #endif // __TEXTSTUB_DYLIB_FILE_H__

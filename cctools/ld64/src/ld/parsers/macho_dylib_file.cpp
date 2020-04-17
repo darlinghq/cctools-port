@@ -42,6 +42,7 @@
 #include "MachOTrie.hpp"
 #include "generic_dylib_file.hpp"
 #include "macho_dylib_file.h"
+#include "PlatformSupport.h"
 #include "../code-sign-blobs/superblob.h"
 
 namespace mach_o {
@@ -62,22 +63,25 @@ public:
 											File(const uint8_t* fileContent, uint64_t fileLength, const char* path,   
 													time_t mTime, ld::File::Ordinal ordinal, bool linkingFlatNamespace, 
 													bool linkingMainExecutable, bool hoistImplicitPublicDylibs, 
-													Options::Platform platform, uint32_t linkMinOSVersion, bool allowSimToMacOSX,
-													bool addVers,  bool buildingForSimulator,
+												 	const ld::VersionSet& platforms, bool allowWeakImports,
+													bool allowSimToMacOSX, bool addVers,  bool buildingForSimulator,
 													bool logAllFiles, const char* installPath,
-													bool indirectDylib, bool ignoreMismatchPlatform, bool usingBitcode);
+													bool indirectDylib, bool usingBitcode, bool internalSDK);
 	virtual									~File() noexcept {}
+	virtual const ld::VersionSet&			platforms() const { return this->_platforms; }
 
 private:
 	using P = typename A::P;
 	using E = typename A::P::E;
+	using pint_t = typename A::P::uint_t;
 
 	void				addDyldFastStub();
-	void				buildExportHashTableFromExportInfo(const macho_dyld_info_command<P>* dyldInfo,
-																				const uint8_t* fileContent);
+	void				buildExportHashTableFromExportInfo(uint32_t exportsOffset, uint32_t exportsSize,
+															const uint8_t* fileContent);
 	void				buildExportHashTableFromSymbolTable(const macho_dysymtab_command<P>* dynamicInfo,
 														const macho_nlist<P>* symbolTable, const char* strings,
 														const uint8_t* fileContent);
+	void				addSymbol(const char* name, bool weakDef = false, bool tlv = false, pint_t address = 0);
 	static const char*	objCInfoSegmentName();
 	static const char*	objCInfoSectionName();
 
@@ -98,16 +102,17 @@ template <typename A> const char* File<A>::objCInfoSectionName() { return "__ima
 template <typename A>
 File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path, time_t mTime,
 			  ld::File::Ordinal ord, bool linkingFlatNamespace, bool linkingMainExecutable,
-			  bool hoistImplicitPublicDylibs, Options::Platform platform, uint32_t linkMinOSVersion,
+			  bool hoistImplicitPublicDylibs, const ld::VersionSet& cmdLinePlatforms, bool allowWeakImports,
 			  bool allowSimToMacOSX, bool addVers, bool buildingForSimulator, bool logAllFiles,
-			  const char* targetInstallPath, bool indirectDylib, bool ignoreMismatchPlatform, bool usingBitcode)
-	: Base(strdup(path), mTime, ord, platform, linkMinOSVersion, linkingFlatNamespace,
-		   hoistImplicitPublicDylibs,   allowSimToMacOSX, addVers), _fileLength(fileLength), _linkeditStartOffset(0)
+			  const char* targetInstallPath, bool indirectDylib, bool usingBitcode, bool internalSDK)
+	: Base(strdup(path), mTime, ord, cmdLinePlatforms, allowWeakImports, linkingFlatNamespace,
+		   hoistImplicitPublicDylibs, allowSimToMacOSX, addVers), _fileLength(fileLength), _linkeditStartOffset(0)
 {
 	const macho_header<P>* header = (const macho_header<P>*)fileContent;
 	const uint32_t cmd_count = header->ncmds();
 	const macho_load_command<P>* const cmds = (macho_load_command<P>*)((char*)header + sizeof(macho_header<P>));
 	const macho_load_command<P>* const cmdsEnd = (macho_load_command<P>*)((char*)header + sizeof(macho_header<P>) + header->sizeofcmds());
+	const uint8_t* const endOfFile = fileContent + fileLength;
 
 	// write out path for -t option
 	if ( logAllFiles )
@@ -132,16 +137,24 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 	// pass 1: get pointers, and see if this dylib uses compressed LINKEDIT format
 	const macho_dysymtab_command<P>* dynamicInfo = nullptr;
 	const macho_dyld_info_command<P>* dyldInfo = nullptr;
+	const macho_linkedit_data_command<P>* exportsTrie = nullptr;
 	const macho_nlist<P>* symbolTable = nullptr;
 	const macho_symtab_command<P>* symtab = nullptr;
 	const char*	strings = nullptr;
 	bool compressedLinkEdit = false;
 	uint32_t dependentLibCount = 0;
-	Options::Platform lcPlatform = Options::kPlatformUnknown;
+	ld::VersionSet lcPlatforms;
 	const macho_load_command<P>* cmd = cmds;
 	for (uint32_t i = 0; i < cmd_count; ++i) {
 		macho_dylib_command<P>* dylibID;
 		uint32_t cmdLength = cmd->cmdsize();
+		if ( (cmdLength & 3) != 0 )
+			throwf("load command #%d has a unaligned size", i);
+		const uint8_t* endOfCmd = ((uint8_t*)cmd)+cmd->cmdsize();
+		if ( endOfCmd > (uint8_t*)cmdsEnd )
+			throwf("load command #%d extends beyond the end of the load commands", i);
+		if ( endOfCmd > endOfFile )
+			throwf("load command #%d extends beyond the end of the file", i);
 		switch (cmd->cmd()) {
 			case LC_SYMTAB:
 				symtab = (macho_symtab_command<P>*)cmd;
@@ -156,6 +169,10 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 			case LC_DYLD_INFO:
 			case LC_DYLD_INFO_ONLY:
 				dyldInfo = (macho_dyld_info_command<P>*)cmd;
+				compressedLinkEdit = true;
+				break;
+			case LC_DYLD_EXPORTS_TRIE:
+				exportsTrie = (macho_linkedit_data_command<P>*)cmd;
 				compressedLinkEdit = true;
 				break;
 			case LC_ID_DYLIB:
@@ -186,15 +203,20 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 				// <rdar://problem/20627554> Don't hoist "public" (in /usr/lib/) dylibs that should not be directly linked
 				this->_hasPublicInstallName = false;
 				break;
+			case LC_RPATH:
+				this->_rpaths.push_back(strdup(((macho_rpath_command<P>*)cmd)->path()));
+				break;
 			case LC_VERSION_MIN_MACOSX:
 			case LC_VERSION_MIN_IPHONEOS:
 			case LC_VERSION_MIN_WATCHOS:
-	#if SUPPORT_APPLE_TV
 			case LC_VERSION_MIN_TVOS:
-	#endif
-				this->_minVersionInDylib = (ld::MacVersionMin)((macho_version_min_command<P>*)cmd)->version();
-				this->_platformInDylib = cmd->cmd();
-				lcPlatform = Options::platformForLoadCommand(this->_platformInDylib);
+				lcPlatforms.insert(ld::PlatformVersion(ld::platformForLoadCommand(cmd->cmd(), (mach_header*)header), ((macho_version_min_command<P>*)cmd)->version()));
+				break;
+			case LC_BUILD_VERSION:
+				{
+					const macho_build_version_command<P>* buildVersCmd = (macho_build_version_command<P>*)cmd;
+					lcPlatforms.insert(ld::PlatformVersion((ld::Platform)buildVersCmd->platform(), buildVersCmd->minos()));
+				}
 				break;
 			case LC_CODE_SIGNATURE:
 				break;
@@ -217,14 +239,6 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 							const uint32_t* contents = (uint32_t*)(&fileContent[sect->offset()]);
 							if ( (sect->size() >= 8) && (contents[0] == 0) ) {
 								uint32_t flags = E::get32(contents[1]);
-								if ( (flags & 4) == 4 )
-									this->_objcConstraint = ld::File::objcConstraintGC;
-								else if ( (flags & 2) == 2 )
-									this->_objcConstraint = ld::File::objcConstraintRetainReleaseOrGC;
-								else if ( (flags & 32) == 32 )
-									this->_objcConstraint = ld::File::objcConstraintRetainReleaseForSimulator;
-								else
-									this->_objcConstraint = ld::File::objcConstraintRetainRelease;
 								this->_swiftVersion = ((flags >> 8) & 0xFF);
 							}
 							else if ( sect->size() > 0 ) {
@@ -248,96 +262,9 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 		if ( cmd > cmdsEnd )
 			throwf("malformed dylb, load command #%d is outside size of load commands in %s", i, path);
 	}
-	// arm/arm64 objects are default to ios platform if not set.
-	// rdar://problem/21746314
-	if (lcPlatform == Options::kPlatformUnknown &&
-		(std::is_same<A, arm>::value || std::is_same<A, arm64>::value))
-		lcPlatform = Options::kPlatformiOS;
 
 	// check cross-linking
-	if ( lcPlatform != platform ) {
-		this->_wrongOS = true;
-		if ( this->_addVersionLoadCommand && !indirectDylib && !ignoreMismatchPlatform ) {
-			if ( buildingForSimulator ) {
-				if ( !this->_allowSimToMacOSXLinking ) {
-					switch (platform) {
-						case Options::kPlatformOSX:
-						case Options::kPlatformiOS:
-							if ( lcPlatform == Options::kPlatformUnknown )
-								break;
-							// fall through if the Platform is not Unknown
-						case Options::kPlatformWatchOS:
-							// WatchOS errors on cross-linking when building for bitcode
-							if ( usingBitcode )
-								throwf("building for %s simulator, but linking against dylib built for %s,",
-								   Options::platformName(platform),
-								   Options::platformName(lcPlatform));
-							else
-								warning("URGENT: building for %s simulator, but linking against dylib (%s) built for %s. "
-										"Note: This will be an error in the future.",
-										Options::platformName(platform), path,
-										Options::platformName(lcPlatform));
-							break;
-	#if SUPPORT_APPLE_TV
-						case Options::kPlatform_tvOS:
-							// tvOS is a warning temporarily. rdar://problem/21746965
-							if ( usingBitcode )
-								throwf("building for %s simulator, but linking against dylib built for %s,",
-									   Options::platformName(platform),
-									   Options::platformName(lcPlatform));
-							else
-								warning("URGENT: building for %s simulator, but linking against dylib (%s) built for %s. "
-										"Note: This will be an error in the future.",
-										Options::platformName(platform), path,
-										Options::platformName(lcPlatform));
-							break;
-	#endif
-						case Options::kPlatformUnknown:
-							// skip if the target platform is unknown
-							break;
-					}
-				}
-			}
-			else {
-				switch (platform) {
-					case Options::kPlatformOSX:
-					case Options::kPlatformiOS:
-						if ( lcPlatform == Options::kPlatformUnknown )
-							break;
-						// fall through if the Platform is not Unknown
-					case Options::kPlatformWatchOS:
-						// WatchOS errors on cross-linking when building for bitcode
-						if ( usingBitcode )
-							throwf("building for %s, but linking against dylib built for %s,",
-							   Options::platformName(platform),
-							   Options::platformName(lcPlatform));
-						else
-							warning("URGENT: building for %s, but linking against dylib (%s) built for %s. "
-									"Note: This will be an error in the future.",
-									Options::platformName(platform), path,
-									Options::platformName(lcPlatform));
-						break;
-	#if SUPPORT_APPLE_TV
-					case Options::kPlatform_tvOS:
-						// tvOS is a warning temporarily. rdar://problem/21746965
-						if ( usingBitcode )
-							throwf("building for %s, but linking against dylib built for %s,",
-								   Options::platformName(platform),
-								   Options::platformName(lcPlatform));
-						else
-							warning("URGENT: building for %s, but linking against dylib (%s) built for %s. "
-									"Note: This will be an error in the future.",
-									Options::platformName(platform), path,
-									Options::platformName(lcPlatform));
-						break;
-	#endif
-					case Options::kPlatformUnknown:
-						// skip if the target platform is unknown
-						break;
-				}
-			}
-		}
-	}
+	cmdLinePlatforms.checkDylibCrosslink(lcPlatforms, path, "dylib", internalSDK, indirectDylib, usingBitcode);
 
 	// figure out if we need to examine dependent dylibs
 	// with compressed LINKEDIT format, MH_NO_REEXPORTED_DYLIBS can be trusted
@@ -459,7 +386,9 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 
 	// build hash table
 	if ( dyldInfo != nullptr )
-		buildExportHashTableFromExportInfo(dyldInfo, fileContent);
+		buildExportHashTableFromExportInfo(dyldInfo->export_off(), dyldInfo->export_size(), fileContent);
+	else if ( exportsTrie != nullptr )
+		buildExportHashTableFromExportInfo(exportsTrie->dataoff(), exportsTrie->datasize(), fileContent);
 	else
 		buildExportHashTableFromSymbolTable(dynamicInfo, symbolTable, strings, fileContent);
 	
@@ -502,16 +431,16 @@ void File<A>::buildExportHashTableFromSymbolTable(const macho_dysymtab_command<P
 
 
 template <typename A>
-void File<A>::buildExportHashTableFromExportInfo(const macho_dyld_info_command<P>* dyldInfo,
+void File<A>::buildExportHashTableFromExportInfo(uint32_t exportsOffset, uint32_t exportsSize,
 												 const uint8_t* fileContent)
 {
 	if ( this->_s_logHashtable )
-		fprintf(stderr, "ld: building hashtable from export info in %s\n", this->path());
-	if ( dyldInfo->export_size() > 0 ) {
-		const uint8_t* start = fileContent + dyldInfo->export_off();
-		const uint8_t* end = &start[dyldInfo->export_size()];
-		if ( (dyldInfo->export_off() + dyldInfo->export_size()) > _fileLength )
-			throwf("malformed mach-o dylib, exports trie extends beyond end of file, ");
+		fprintf(stderr, "ld: building hashtable from export trie in %s\n", this->path());
+	if ( exportsSize > 0 ) {
+		const uint8_t* start = fileContent + exportsOffset;
+		const uint8_t* end = &start[exportsSize];
+		if ( (exportsOffset + exportsSize) > _fileLength )
+			throwf("malformed mach-o dylib, exports trie extends beyond end of file");
 		std::vector<mach_o::trie::Entry> list;
 		parseTrie(start, end, list);
 		for (const auto &entry : list)
@@ -522,6 +451,78 @@ void File<A>::buildExportHashTableFromExportInfo(const macho_dyld_info_command<P
 	}
 }
 
+template <typename A>
+void File<A>::addSymbol(const char* name, bool weakDef, bool tlv, pint_t address)
+{
+	__block uint32_t linkMinOSVersion = 0;
+
+	this->platforms().forEach(^(ld::Platform platform, uint32_t minVersion, uint32_t sdkVersion, bool &stop) {
+		//FIXME hack to handle symbol versioning in a zippered world.
+		//This will need to be rethought
+		if (linkMinOSVersion == 0)
+			linkMinOSVersion = minVersion;
+		if (platform == ld::Platform::macOS)
+			linkMinOSVersion = minVersion;
+	});
+
+	// symbols that start with $ld$ are meta-data to the static linker
+	// <rdar://problem/5182537> need way for ld and dyld to see different exported symbols in a dylib
+	if ( strncmp(name, "$ld$", 4) == 0 ) {
+		//    $ld$ <action> $ <condition> $ <symbol-name>
+		const char* symAction = &name[4];
+		const char* symCond = strchr(symAction, '$');
+		if ( symCond != nullptr ) {
+			char curOSVers[16];
+			sprintf(curOSVers, "$os%d.%d$", (linkMinOSVersion >> 16), ((linkMinOSVersion >> 8) & 0xFF));
+			if ( strncmp(symCond, curOSVers, strlen(curOSVers)) == 0 ) {
+				const char* symName = strchr(&symCond[1], '$');
+				if ( symName != nullptr ) {
+					++symName;
+					if ( strncmp(symAction, "hide$", 5) == 0 ) {
+						if ( this->_s_logHashtable )
+							fprintf(stderr, "  adding %s to ignore set for %s\n", symName, this->path());
+						this->_ignoreExports.insert(strdup(symName));
+						return;
+					}
+					else if ( strncmp(symAction, "add$", 4) == 0 ) {
+						this->addSymbol(symName, weakDef);
+						return;
+					}
+					else if ( strncmp(symAction, "weak$", 5) == 0 ) {
+						if ( !this->_allowWeakImports )
+							this->_ignoreExports.insert(strdup(symName));
+					}
+					else if ( strncmp(symAction, "install_name$", 13) == 0 ) {
+						this->_dylibInstallPath = strdup(symName);
+						this->_installPathOverride = true;
+						// <rdar://problem/14448206> CoreGraphics redirects to ApplicationServices, but with wrong compat version
+						if ( strcmp(this->_dylibInstallPath, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices") == 0 )
+							this->_dylibCompatibilityVersion = Options::parseVersionNumber32("1.0");
+						return;
+					}
+					else if ( strncmp(symAction, "compatibility_version$", 22) == 0 ) {
+						this->_dylibCompatibilityVersion = Options::parseVersionNumber32(symName);
+						return;
+					}
+					else {
+						warning("bad symbol action: %s in dylib %s", name, this->path());
+					}
+				}
+			}
+		}
+		else {
+			warning("bad symbol condition: %s in dylib %s", name, this->path());
+		}
+	}
+
+	// add symbol as possible export if we are not supposed to ignore it
+	if ( this->_ignoreExports.count(name) == 0 ) {
+		typename Base::AtomAndWeak bucket = { nullptr, weakDef, tlv, address };
+		if ( this->_s_logHashtable )
+			fprintf(stderr, "  adding %s to hash table for %s\n", name, this->path());
+		this->_atoms[strdup(name)] = bucket;
+	}
+}
 
 template <>
 void File<x86_64>::addDyldFastStub()
@@ -549,21 +550,66 @@ public:
 
 	static bool				validFile(const uint8_t* fileContent, bool executableOrDyliborBundle, bool subTypeMustMatch=false, uint32_t subType=0);
 	static const char*		fileKind(const uint8_t* fileContent);
+	static ld::Platform 	findPlatform(const macho_header<P>* header, uint64_t fileLength, uint32_t* minOsVers);
+	static uint8_t			loadCommandSizeMask();
 	static ld::dylib::File*	parse(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 								  time_t mTime, ld::File::Ordinal ordinal, const Options& opts,
 								  bool indirectDylib)
 	{
 		return new File<A>(fileContent, fileLength, path, mTime, ordinal, opts.flatNamespace(),
 						   opts.linkingMainExecutable(), opts.implicitlyLinkIndirectPublicDylibs(),
-						   opts.platform(), opts.minOSversion(),
+						   opts.platforms(), opts.allowWeakImports(),
 						   opts.allowSimulatorToLinkWithMacOSX(), opts.addVersionLoadCommand(),
 						   opts.targetIOSSimulator(), opts.logAllFiles(), opts.installPath(),
-						   indirectDylib, opts.outputKind() == Options::kPreload, opts.bundleBitcode());
+						   indirectDylib, opts.bundleBitcode(), opts.internalSDK());
 	}
 
 };
 
+template <> uint8_t Parser<x86>::loadCommandSizeMask()		{ return 0x03; }
+template <> uint8_t Parser<x86_64>::loadCommandSizeMask()	{ return 0x07; }
+template <> uint8_t Parser<arm>::loadCommandSizeMask()		{ return 0x03; }
+template <> uint8_t Parser<arm64>::loadCommandSizeMask()	{ return 0x07; }
 
+template <typename A>
+ld::Platform Parser<A>::findPlatform(const macho_header<P>* header, uint64_t fileLength, uint32_t* minOsVers)
+{
+	const uint32_t cmd_count = header->ncmds();
+	if ( cmd_count == 0 )
+		return ld::Platform::unknown;
+	const uint8_t* const endOfFile = (uint8_t*)header + fileLength;
+	const macho_load_command<P>* const cmds = (macho_load_command<P>*)((char*)header + sizeof(macho_header<P>));
+	const macho_load_command<P>* const cmdsEnd = (macho_load_command<P>*)((char*)header + sizeof(macho_header<P>) + header->sizeofcmds());
+	const macho_load_command<P>* cmd = cmds;
+	for (uint32_t i = 0; i < cmd_count; ++i) {
+		uint32_t size = cmd->cmdsize();
+		if ( (size & loadCommandSizeMask()) != 0 )
+			throwf("load command #%d has a unaligned size", i);
+		const uint8_t* endOfCmd = ((uint8_t*)cmd)+cmd->cmdsize();
+		if ( endOfCmd > (uint8_t*)cmdsEnd )
+			throwf("load command #%d extends beyond the end of the load commands", i);
+		if ( endOfCmd > endOfFile )
+			throwf("load command #%d extends beyond the end of the file", i);
+		const macho_version_min_command<P>* versCmd = (macho_version_min_command<P>*)cmd;
+		const macho_build_version_command<P>* buildVersCmd = (macho_build_version_command<P>*)cmd;
+		switch (cmd->cmd()) {
+			case LC_VERSION_MIN_MACOSX:
+			case LC_VERSION_MIN_IPHONEOS:
+			case LC_VERSION_MIN_WATCHOS:
+			case LC_VERSION_MIN_TVOS:
+				*minOsVers = versCmd->version();
+				return ld::platformForLoadCommand(cmd->cmd(), (mach_header*)header);
+			case LC_BUILD_VERSION:
+				*minOsVers = buildVersCmd->minos();
+				return ld::platformFromBuildVersion(buildVersCmd->platform(), (mach_header*)header);
+		}
+		cmd = (const macho_load_command<P>*)(((char*)cmd)+cmd->cmdsize());
+		if ( cmd > cmdsEnd )
+			throwf("malformed mach-o file, load command #%d is outside size of load commands", i);
+	}
+	*minOsVers = 0;
+	return ld::Platform::unknown;
+}
 
 template <>
 bool Parser<x86>::validFile(const uint8_t* fileContent, bool executableOrDyliborBundle, bool subTypeMustMatch, uint32_t subType)
@@ -678,28 +724,34 @@ bool Parser<arm64>::validFile(const uint8_t* fileContent, bool executableOrDylib
 }
 
 
-bool isDylibFile(const uint8_t* fileContent, cpu_type_t* result, cpu_subtype_t* subResult)
+bool isDylibFile(const uint8_t* fileContent, uint64_t fileLength, cpu_type_t* result, cpu_subtype_t* subResult, ld::Platform* platform, uint32_t* minOsVers)
 {
 	if ( Parser<x86_64>::validFile(fileContent, false) ) {
 		*result = CPU_TYPE_X86_64;
 		const auto* header = reinterpret_cast<const macho_header<Pointer64<LittleEndian>>*>(fileContent);
 		*subResult = header->cpusubtype();
+		*platform = Parser<x86_64>::findPlatform(header, fileLength, minOsVers);
 		return true;
 	}
 	if ( Parser<x86>::validFile(fileContent, false) ) {
 		*result = CPU_TYPE_I386;
 		*subResult = CPU_SUBTYPE_X86_ALL;
+		const auto* header = reinterpret_cast<const macho_header<Pointer32<LittleEndian>>*>(fileContent);
+		*platform = Parser<x86>::findPlatform(header, fileLength, minOsVers);
 		return true;
 	}
 	if ( Parser<arm>::validFile(fileContent, false) ) {
 		*result = CPU_TYPE_ARM;
 		const auto* header = reinterpret_cast<const macho_header<Pointer32<LittleEndian>>*>(fileContent);
 		*subResult = header->cpusubtype();
+		*platform = Parser<arm>::findPlatform(header, fileLength, minOsVers);
 		return true;
 	}
 	if ( Parser<arm64>::validFile(fileContent, false) ) {
 		*result = CPU_TYPE_ARM64;
-		*subResult = CPU_SUBTYPE_ARM64_ALL;
+		const auto* header = reinterpret_cast<const macho_header<Pointer64<LittleEndian>>*>(fileContent);
+		*subResult = header->cpusubtype();
+		*platform = Parser<arm64>::findPlatform(header, fileLength, minOsVers);
 		return true;
 	}
 	return false;
@@ -756,6 +808,7 @@ const char* Parser<arm64>::fileKind(const uint8_t* fileContent)
 }
 #endif
 
+
 //
 // used by linker is error messages to describe mismatched files
 //
@@ -771,7 +824,7 @@ const char* archName(const uint8_t* fileContent)
 		return Parser<arm>::fileKind(fileContent);
 	}
 #if SUPPORT_ARCH_arm64
-	if ( Parser<arm64>::validFile(fileContent, false) ) {
+	if ( Parser<arm64>::validFile(fileContent, true) ) {
 		return Parser<arm64>::fileKind(fileContent);
 	}
 #endif
@@ -779,42 +832,63 @@ const char* archName(const uint8_t* fileContent)
 }
 
 
-//
-// main function used by linker to instantiate ld::Files
-//
-ld::dylib::File* parse(const uint8_t* fileContent, uint64_t fileLength, const char* path,
-					   time_t modTime, const Options& opts, ld::File::Ordinal ordinal,
-					   bool bundleLoader, bool indirectDylib)
+static ld::dylib::File* parseAsArchitecture(const uint8_t* fileContent, uint64_t fileLength, const char* path,
+											time_t modTime, const Options& opts, ld::File::Ordinal ordinal,
+											bool bundleLoader, bool indirectDylib,
+											cpu_type_t architecture, cpu_subtype_t subArchitecture)
 {
 	bool subTypeMustMatch = opts.enforceDylibSubtypesMatch();
-	switch ( opts.architecture() ) {
+	switch ( architecture) {
 #if SUPPORT_ARCH_x86_64
 		case CPU_TYPE_X86_64:
-			if ( Parser<x86_64>::validFile(fileContent, bundleLoader, subTypeMustMatch, opts.subArchitecture()) )
+			if ( Parser<x86_64>::validFile(fileContent, bundleLoader, subTypeMustMatch, subArchitecture) )
 				return Parser<x86_64>::parse(fileContent, fileLength, path, modTime, ordinal, opts, indirectDylib);
-			break;
+				break;
 #endif
 #if SUPPORT_ARCH_i386
 		case CPU_TYPE_I386:
-			if ( Parser<x86>::validFile(fileContent, bundleLoader, subTypeMustMatch, opts.subArchitecture()) )
+			if ( Parser<x86>::validFile(fileContent, bundleLoader, subTypeMustMatch, subArchitecture) )
 				return Parser<x86>::parse(fileContent, fileLength, path, modTime, ordinal, opts, indirectDylib);
-			break;
+				break;
 #endif
 #if SUPPORT_ARCH_arm_any
 		case CPU_TYPE_ARM:
-			if ( Parser<arm>::validFile(fileContent, bundleLoader, subTypeMustMatch, opts.subArchitecture()) )
+			if ( Parser<arm>::validFile(fileContent, bundleLoader, subTypeMustMatch, subArchitecture) )
 				return Parser<arm>::parse(fileContent, fileLength, path, modTime, ordinal, opts, indirectDylib);
-			break;
+				break;
 #endif
 #if SUPPORT_ARCH_arm64
 		case CPU_TYPE_ARM64:
-			if ( Parser<arm64>::validFile(fileContent, bundleLoader, subTypeMustMatch, opts.subArchitecture()) )
+			if ( Parser<arm64>::validFile(fileContent, bundleLoader, subTypeMustMatch, subArchitecture) )
 				return Parser<arm64>::parse(fileContent, fileLength, path, modTime, ordinal, opts, indirectDylib);
-			break;
+				break;
 #endif
 	}
 	return nullptr;
 }
+
+//
+// main function used by linker to instantiate ld::Files
+//
+ld::dylib::File* parse(const uint8_t* fileContent, uint64_t fileLength, const char* path,
+					   time_t modtime, const Options& opts, ld::File::Ordinal ordinal,
+					   bool bundleLoader, bool indirectDylib)
+{
+	// First make sure we are even a dylib with a known arch.  If we aren't then there's no point in continuing.
+	if (!archName(fileContent))
+		return nullptr;
+
+	auto file = parseAsArchitecture(fileContent, fileLength, path, modtime, opts, ordinal, bundleLoader, indirectDylib, opts.architecture(), opts.subArchitecture());
+
+	// If we've been provided with an architecture we can fall back to, try to parse the dylib as that instead.
+	if (!file && opts.fallbackArchitecture()) {
+		warning("architecture %s not present in dylib file %s, attempting fallback", opts.architectureName(), path);
+		file = parseAsArchitecture(fileContent, fileLength, path, modtime, opts, ordinal, bundleLoader, indirectDylib, opts.fallbackArchitecture(), opts.fallbackSubArchitecture());
+	}
+		
+	return file;
+}
+	
 
 
 }; // namespace dylib
