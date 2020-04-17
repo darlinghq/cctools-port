@@ -1,5 +1,7 @@
 project(ld64)
 
+add_definitions(-DHAVE_BCMP=1 -DHAVE_BZERO=1 -DHAVE_BCOPY=1 -DHAVE_INDEX=1 -DHAVE_RINDEX=1)
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fblocks -std=c++11 -Wno-long-long -Wno-import -Wno-format -Wno-deprecated -Wno-unused-variable -Wno-unused-private-field -Wno-unused-function -Wno-invalid-offsetof -Wno-int-conversion -Wno-char-subscripts -Wno-shift-negative-value")
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../include)
@@ -42,6 +44,8 @@ set(ld64_sources
 	./ld/passes/compact_unwind.cpp
 	./ld/passes/code_dedup.cpp
 	./ld/passes/got.cpp
+	ld/passes/inits.cpp
+	ld/passes/thread_starts.cpp
 	./ld/passes/tlvp.cpp
 	./ld/passes/branch_shim.cpp
 	./ld/passes/dtrace_dof.cpp
@@ -51,6 +55,7 @@ set(ld64_sources
 	./ld/passes/huge.cpp
 	./ld/passes/bitcode_bundle.cpp
 	./ld/passes/objc.cpp
+	ld/PlatformSupport.cpp
 	./3rd/md5.c
 	./3rd/strlcat.c
 	./3rd/BlocksRuntime/runtime.c
@@ -59,6 +64,7 @@ set(ld64_sources
 	./3rd/strlcpy.c
 	./3rd/qsort_r.c
 	./3rd/eprintf.c
+	3rd/mkpath_np.c
 	./ld/debugline.c
 )
 
