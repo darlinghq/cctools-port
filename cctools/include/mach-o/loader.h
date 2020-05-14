@@ -28,6 +28,14 @@
  */
 #include <stdint.h>
 
+#ifdef DARLING
+
+typedef int cpu_type_t;
+typedef int cpu_subtype_t;
+typedef int vm_prot_t;
+
+#else // !DARLING
+
 /*
  * <mach/machine.h> is needed here for the cpu_type_t and cpu_subtype_t types
  * and contains the constants for the possible values of these types.
@@ -54,6 +62,8 @@
 #if __has_include(<architecture/byte_order.h>)
 #include <architecture/byte_order.h>
 #endif
+
+#endif // DARLING
 
 /*
  * The 32-bit mach header appears at the very beginning of the object file for

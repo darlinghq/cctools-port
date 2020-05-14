@@ -43,6 +43,13 @@
  */
 #include <stdint.h>
 
+#ifdef DARLING
+
+typedef int cpu_type_t;
+typedef int cpu_subtype_t;
+
+#else // !DARLING
+
 #if __has_include(<mach/machine.h>)
 #include <mach/machine.h>
 #endif
@@ -50,6 +57,8 @@
 #if __has_include(<architecture/byte_order.h>)
 #include <architecture/byte_order.h>
 #endif
+
+#endif // DARLING
 
 #define FAT_MAGIC	0xcafebabe
 #define FAT_CIGAM	0xbebafeca	/* NXSwapLong(FAT_MAGIC) */
