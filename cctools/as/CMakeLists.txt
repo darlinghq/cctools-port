@@ -22,7 +22,7 @@ add_compile_definitions(
 	NeXT_MOD
 	__DARWIN_UNIX03
 	__LITTLE_ENDIAN__
-	PROGRAM_PREFIX="x86_64-apple-darwin11-"
+	PROGRAM_PREFIX="${APPLE_TARGET_TRIPLET_PRIMARY}-"
 	PACKAGE_NAME="cctools-darling"
 	PACKAGE_VERSION="949.0.1"
 	__STDC_LIMIT_MACROS=1
@@ -118,4 +118,4 @@ elseif(TARGET_ARM64)
 	list(APPEND AS_SOURCES arm.c)
 endif()
 
-add_executable(x86_64-apple-darwin11-as ${AS_SOURCES})
+add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-as ${AS_SOURCES})
