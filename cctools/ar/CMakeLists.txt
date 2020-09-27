@@ -15,7 +15,7 @@ add_definitions(-U__APPLE__
 	-U__APPLE__
 	-U_DARWIN_C_SOURCE
 	-U_POSIX_C_SOURCE
-	-DPROGRAM_PREFIX="x86_64-apple-darwin11-"
+	-DPROGRAM_PREFIX="${APPLE_TARGET_TRIPLET_PRIMARY}-"
 	-DSTDC_HEADERS=1 -DHAVE_SYS_TYPES_H=1 -DHAVE_SYS_STAT_H=1 -DHAVE_STDLIB_H=1 -DHAVE_STRING_H=1 -DHAVE_MEMORY_H=1 -DHAVE_STRINGS_H=1 -DHAVE_INTTYPES_H=1 -DHAVE_STDINT_H=1 -DHAVE_UNISTD_H=1 -DHAVE_DLFCN_H=1
 	-Du_short=uint16_t -Du_int=uint32_t
 	-D__USE_MISC)
@@ -52,7 +52,7 @@ set(ar_sources
 	../libstuff/allocate.c
 )
 
-add_executable(x86_64-apple-darwin11-ar ${ar_sources})
+add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-ar ${ar_sources})
 
 set(ranlib_sources
 	../misc/libtool.c
@@ -60,5 +60,5 @@ set(ranlib_sources
 )
 add_executable(ranlib ${ranlib_sources})
 set_property(TARGET ranlib APPEND_STRING PROPERTY COMPILE_FLAGS " -DRANLIB")
-set_target_properties(ranlib PROPERTIES OUTPUT_NAME "x86_64-apple-darwin11-ranlib")
+set_target_properties(ranlib PROPERTIES OUTPUT_NAME "${APPLE_TARGET_TRIPLET_PRIMARY}-ranlib")
 
