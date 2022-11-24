@@ -4,6 +4,8 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
     add_compile_definitions(__arm64__)
 endif()
 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-everything")
+
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include/foreign)
 
@@ -68,4 +70,3 @@ set(lipo_sources
 
 add_executable(lipo ${lipo_sources})
 target_link_libraries(lipo m)
-
