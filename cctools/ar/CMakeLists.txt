@@ -4,6 +4,8 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
     add_compile_definitions(__arm64__)
 endif()
 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-everything")
+
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include/foreign)
 
@@ -61,4 +63,3 @@ set(ranlib_sources
 add_executable(ranlib ${ranlib_sources})
 set_property(TARGET ranlib APPEND_STRING PROPERTY COMPILE_FLAGS " -DRANLIB")
 set_target_properties(ranlib PROPERTIES OUTPUT_NAME "${APPLE_TARGET_TRIPLET_PRIMARY}-ranlib")
-
