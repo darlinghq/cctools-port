@@ -40,26 +40,29 @@ elseif (TARGET_ARM64)
 endif(TARGET_x86_64 OR TARGET_i386)
 
 add_library(stuff OBJECT
-	../libstuff/fatals.c
-	../libstuff/bytesex.c
+	../libstuff/align.c
 	../libstuff/allocate.c
-	../libstuff/errors.c
+	../libstuff/apple_version.c
 	../libstuff/arch.c
 	../libstuff/arch_usage.c
-	../libstuff/port.c
-	../libstuff/apple_version.c
+	../libstuff/args.c
+	../libstuff/bytesex.c
+	../libstuff/depinfo.c
+	../libstuff/diagnostics.c
+	../libstuff/errors.c
 	../libstuff/execute.c
-	../libstuff/rnd.c
+	../libstuff/fatals.c
+	../libstuff/get_arch_from_host.c
+	../libstuff/get_toc_byte_sex.c
 	../libstuff/ofile.c
 	../libstuff/ofile_error.c
+	../libstuff/port.c
+	../libstuff/print.c
+	../libstuff/rnd.c
+	../libstuff/set_arch_flag_name.c
+	../libstuff/swap_headers.c
 	../libstuff/unix_standard_mode.c
 	../libstuff/version_number.c
-	../libstuff/print.c
-	../libstuff/swap_headers.c
-	../libstuff/get_arch_from_host.c
-	../libstuff/set_arch_flag_name.c
-	../libstuff/get_toc_byte_sex.c
-	../libstuff/args.c
 	../libstuff/write64.c
 )
 

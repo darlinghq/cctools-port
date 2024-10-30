@@ -47,11 +47,13 @@ set(ar_sources
 	move.c
 	print.c
 	replace.c
-	../libstuff/unix_standard_mode.c
-	../libstuff/execute.c
-	../libstuff/port.c
-	../libstuff/fatals.c
+
 	../libstuff/allocate.c
+	../libstuff/diagnostics.c
+	../libstuff/execute.c
+	../libstuff/fatals.c
+	../libstuff/port.c
+	../libstuff/unix_standard_mode.c
 )
 
 add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-ar ${ar_sources})
