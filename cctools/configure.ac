@@ -1,4 +1,4 @@
-AC_INIT([cctools], [1010.6], [t.poechtrager@gmail.com])
+AC_INIT([cctools], [1021.4], [t.poechtrager@gmail.com])
 
 AC_CANONICAL_BUILD
 AC_CANONICAL_HOST
@@ -580,11 +580,6 @@ AC_C_BIGENDIAN([AC_SUBST([ENDIAN_FLAG],[-D__BIG_ENDIAN__=1])],
 AC_CONFIG_FILES([Makefile libstuff/Makefile libmacho/Makefile])
 AC_CONFIG_FILES([ar/Makefile])
 AC_CONFIG_FILES([as/Makefile])
-AC_CONFIG_FILES([as/arm/Makefile])
-AC_CONFIG_FILES([as/i386/Makefile])
-AC_CONFIG_FILES([as/x86_64/Makefile])
-AC_CONFIG_FILES([as/ppc/Makefile])
-AC_CONFIG_FILES([as/ppc64/Makefile])
 AC_CONFIG_FILES([man/Makefile])
 AC_CONFIG_FILES([misc/Makefile])
 AC_CONFIG_FILES([otool/Makefile])
