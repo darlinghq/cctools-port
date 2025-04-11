@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-BASE_VERSION=907
-NEW_VERSION=951.9
+BASE_VERSION=951.9
+NEW_VERSION=954.16
 
 set -e
 
