@@ -928,6 +928,7 @@ void Resolver::addInitialUndefines()
 		_symbolTable.findSlotForName(*it);
 	}
 
+#ifdef LTO_SUPPORT // ld64-port
 	if ( _haveLLVMObjs && _options.ltoSoftloadRuntimeSymbols() ) {
 		// when building firmware with LTO, make sure all surprise symbols libLTO might generate are loaded if possible
 		// add these symbols before resolving other undefines, because adding them might pull in other symbols
@@ -939,6 +940,7 @@ void Resolver::addInitialUndefines()
 			}
 		}
 	}
+#endif
 }
 
 void Resolver::resolveCurrentUndefines() {
