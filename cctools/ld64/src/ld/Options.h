@@ -327,14 +327,26 @@ public:
 	uint64_t					customStackAddr() const { return fStackAddr; }
 	bool						hasExecutableStack() const { return fExecutableStack; }
 	bool						hasNonExecutableHeap() const { return fNonExecutableHeap; }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	UndefinesIterator			initialUndefinesBegin() const { return fInitialUndefines.data(); }
+	UndefinesIterator			initialUndefinesEnd() const { return fInitialUndefines.data() + fInitialUndefines.size(); }
+#else // !DARLING
 	UndefinesIterator			initialUndefinesBegin() const { return &fInitialUndefines[0]; }
 	UndefinesIterator			initialUndefinesEnd() const { return &fInitialUndefines[fInitialUndefines.size()]; }
+#endif // DARLING
 	const std::vector<const char*>&	initialUndefines() const { return fInitialUndefines; }
 	bool						printWhyLive(const char* name) const;
 	uint32_t					minimumHeaderPad() const { return fMinimumHeaderPad; }
 	bool						maxMminimumHeaderPad() const { return fMaxMinimumHeaderPad; }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	ExtraSection::const_iterator	extraSectionsBegin() const { return fExtraSections.data(); }
+	ExtraSection::const_iterator	extraSectionsEnd() const { return fExtraSections.data() + fExtraSections.size(); }
+#else // !DARLING
 	ExtraSection::const_iterator	extraSectionsBegin() const { return &fExtraSections[0]; }
 	ExtraSection::const_iterator	extraSectionsEnd() const { return &fExtraSections[fExtraSections.size()]; }
+#endif // DARLING
 	CommonsMode					commonsMode() const { return fCommonsMode; }
 	bool						warnCommons() const { return fWarnCommons; }
 	bool						keepRelocations();
@@ -356,8 +368,14 @@ public:
 	const char*					dTraceScriptName() { return fDtraceScriptName; }
 	bool						dTrace() { return (fDtraceScriptName != NULL); }
 	unsigned long				orderedSymbolsCount() const { return fOrderedSymbols.size(); }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	OrderedSymbolsIterator		orderedSymbolsBegin() const { return fOrderedSymbols.data(); }
+	OrderedSymbolsIterator		orderedSymbolsEnd() const { return fOrderedSymbols.data() + fOrderedSymbols.size(); }
+#else // !DARLING
 	OrderedSymbolsIterator		orderedSymbolsBegin() const { return &fOrderedSymbols[0]; }
 	OrderedSymbolsIterator		orderedSymbolsEnd() const { return &fOrderedSymbols[fOrderedSymbols.size()]; }
+#endif // DARLING
 	uint64_t					baseWritableAddress() { return fBaseWritableAddress; }
 	uint64_t					segmentAlignment() const { return fSegmentAlignment; }
 	uint64_t					segPageSize(const char* segName) const;

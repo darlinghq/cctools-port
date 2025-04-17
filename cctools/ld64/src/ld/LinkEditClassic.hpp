@@ -733,12 +733,22 @@ uint64_t SymbolTableAtom<A>::size() const
 template <typename A>
 void SymbolTableAtom<A>::copyRawContent(uint8_t buffer[]) const
 {
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	memcpy(&buffer[this->_writer._localSymbolsStartIndex*sizeof(macho_nlist<P>)], _locals.data(), 
+												this->_writer._localSymbolsCount*sizeof(macho_nlist<P>));
+	memcpy(&buffer[this->_writer._globalSymbolsStartIndex*sizeof(macho_nlist<P>)], _globals.data(),
+												this->_writer._globalSymbolsCount*sizeof(macho_nlist<P>));
+	memcpy(&buffer[this->_writer._importSymbolsStartIndex *sizeof(macho_nlist<P>)], _imports.data(), 
+												this->_writer._importSymbolsCount*sizeof(macho_nlist<P>));
+#else // !DARLING
 	memcpy(&buffer[this->_writer._localSymbolsStartIndex*sizeof(macho_nlist<P>)], &_locals[0], 
 												this->_writer._localSymbolsCount*sizeof(macho_nlist<P>));
 	memcpy(&buffer[this->_writer._globalSymbolsStartIndex*sizeof(macho_nlist<P>)], &_globals[0],
 												this->_writer._globalSymbolsCount*sizeof(macho_nlist<P>));
 	memcpy(&buffer[this->_writer._importSymbolsStartIndex *sizeof(macho_nlist<P>)], &_imports[0], 
 												this->_writer._importSymbolsCount*sizeof(macho_nlist<P>));
+#endif // DARLING
 }
 
 
@@ -877,7 +887,12 @@ uint64_t LocalRelocationsAtom<A>::size() const
 template <typename A>
 void LocalRelocationsAtom<A>::copyRawContent(uint8_t buffer[]) const
 {
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	memcpy(buffer, _relocs.data(), _relocs.size()*sizeof(macho_relocation_info<P>));
+#else // !DARLING
 	memcpy(buffer, &_relocs[0], _relocs.size()*sizeof(macho_relocation_info<P>));
+#endif // DARLING
 }
 
 

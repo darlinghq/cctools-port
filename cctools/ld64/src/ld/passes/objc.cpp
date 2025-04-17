@@ -164,7 +164,12 @@ public:
 		A::P::E::set32(*((uint32_t*)(&buffer[4])), _methodCount);
 	}
 	virtual ld::Fixup::iterator				fixupsBegin() const	{ return (ld::Fixup*)&_fixups[0]; }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	virtual ld::Fixup::iterator				fixupsEnd()	const	{ return ((ld::Fixup*)_fixups.data()) + _fixups.size(); }
+#else // !DARLING
 	virtual ld::Fixup::iterator				fixupsEnd()	const	{ return (ld::Fixup*)&_fixups[_fixups.size()]; }
+#endif // DARLING
 
 private:	
 	typedef typename A::P::uint_t			pint_t;
@@ -200,7 +205,12 @@ public:
 		A::P::setP(*((pint_t*)(buffer)), _protocolCount);
 	}
 	virtual ld::Fixup::iterator				fixupsBegin() const	{ return (ld::Fixup*)&_fixups[0]; }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	virtual ld::Fixup::iterator				fixupsEnd()	const	{ return ((ld::Fixup*)_fixups.data()) + _fixups.size(); }
+#else // !DARLING
 	virtual ld::Fixup::iterator				fixupsEnd()	const	{ return (ld::Fixup*)&_fixups[_fixups.size()]; }
+#endif // DARLING
 
 private:	
 	typedef typename A::P::uint_t			pint_t;
@@ -241,7 +251,12 @@ public:
 		A::P::E::set32(((uint32_t*)(buffer))[1], _propertyCount);
 	}
 	virtual ld::Fixup::iterator				fixupsBegin() const	{ return (ld::Fixup*)&_fixups[0]; }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	virtual ld::Fixup::iterator				fixupsEnd()	const	{ return ((ld::Fixup*)_fixups.data()) + _fixups.size(); }
+#else // !DARLING
 	virtual ld::Fixup::iterator				fixupsEnd()	const	{ return (ld::Fixup*)&_fixups[_fixups.size()]; }
+#endif // DARLING
 
 private:	
 	typedef typename A::P::uint_t			pint_t;
@@ -284,7 +299,12 @@ public:
 															{ return _atom->canCoalesceWith(rhs,ibt); }
 
 	virtual ld::Fixup::iterator			fixupsBegin() const	{ return (ld::Fixup*)&_fixups[0]; }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	virtual ld::Fixup::iterator			fixupsEnd()	const	{ return ((ld::Fixup*)_fixups.data()) + _fixups.size(); }
+#else // !DARLING
 	virtual ld::Fixup::iterator			fixupsEnd()	const	{ return (ld::Fixup*)&_fixups[_fixups.size()]; }
+#endif // DARLING
 
 protected:
 	void addFixupAtOffset(uint32_t offset);

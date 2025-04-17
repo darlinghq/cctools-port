@@ -50,7 +50,12 @@ public:
 	std::vector<uint8_t>& bytes() { return _data; }
 	unsigned long size() const { return _data.size(); }
 	void reserve(unsigned long l) { _data.reserve(l); }
+#ifdef DARLING
+	// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+	const uint8_t* start() const { return _data.data(); }
+#else // !DARLING
 	const uint8_t* start() const { return &_data[0]; }
+#endif // DARLING
 
 	void append_uleb128(uint64_t value) {
 		uint8_t byte;
@@ -1320,19 +1325,34 @@ void ChainedInfoAtom<A>::encode() const
 			this->_encodedData.pad_to_size(4);
 			chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
 			chainHeader->imports_offset = this->_encodedData.size();
+#ifdef DARLING
+			// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+			this->_encodedData.append_mem(imports.data(), sizeof(dyld_chained_import)*imports.size());
+#else // !DARLING
 			this->_encodedData.append_mem(&imports[0], sizeof(dyld_chained_import)*imports.size());
+#endif // DARLING
 			break;
 		case DYLD_CHAINED_IMPORT_ADDEND:
 			this->_encodedData.pad_to_size(4);
 			chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
 			chainHeader->imports_offset = this->_encodedData.size();
+#ifdef DARLING
+			// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+			this->_encodedData.append_mem(importsAddend.data(), sizeof(dyld_chained_import_addend)*importsAddend.size());
+#else // !DARLING
 			this->_encodedData.append_mem(&importsAddend[0], sizeof(dyld_chained_import_addend)*importsAddend.size());
+#endif // DARLING
 			break;
 		case DYLD_CHAINED_IMPORT_ADDEND64:
 			this->_encodedData.pad_to_size(8);
 			chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
 			chainHeader->imports_offset = this->_encodedData.size();
+#ifdef DARLING
+			// For some standard libraries, there is an assertion check in operator[] for accessing the index out of bounds
+			this->_encodedData.append_mem(importsAddend64.data(), sizeof(dyld_chained_import_addend64)*importsAddend64.size());
+#else // !DARLING
 			this->_encodedData.append_mem(&importsAddend64[0], sizeof(dyld_chained_import_addend64)*importsAddend64.size());
+#endif // DARLING
 			break;
 	}
 	chainHeader = (dyld_chained_fixups_header*)(this->_encodedData.start());
