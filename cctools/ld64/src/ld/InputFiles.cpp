@@ -1648,8 +1648,12 @@ void InputFiles::dylibs(ld::Internal& state)
 			grandfather = true;
 		}
 
+#ifndef DARLING
+		// We need to ignore this check since Darling will create a shared
+		// library stub (firstpass) before creating the actual shared library.
 		if ( !grandfather )
 			throw "dynamic executables or dylibs must link with libSystem.dylib";
+#endif // DARLING
 	}
 }
 
