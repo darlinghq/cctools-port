@@ -1,6 +1,5 @@
 project(as)
 
-
 if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
 	add_compile_definitions(__arm64__)
 endif()
@@ -55,8 +54,6 @@ add_definitions(
 	-U_POSIX_C_SOURCE
 )
 
-remove_definitions()
-
 if(TARGET_x86_64 OR TARGET_i386)
 	add_compile_definitions(
 		I386
@@ -76,46 +73,9 @@ include_directories(AFTER
 	${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+
 set(AS_SOURCES
-	app.c
 	as.c
-	atof-generic.c
-	atof-ieee.c
-	expr.c
-	fixes.c 
-	flonum-const.c
-	flonum-copy.c
-	flonum-mult.c
-	frags.c
-	hash.c
-	hex-value.c
-	input-file.c
-	input-scrub.c
-	layout.c
-	messages.c
-	obstack.c
-	read.c
-	sections.c
-	symbols.c
-	write_object.c
-	xmalloc.c
-	dwarf2dbg.c
-
-	../libstuff/apple_version.c
-	../libstuff/arch.c
-	../libstuff/rnd.c
-	../libstuff/port.c
-	../libstuff/write64.c
-	../libstuff/bytesex.c
-	../libstuff/best_arch.c
-	../libstuff/allocate.c
-	../libstuff/fatals.c
 )
-
-if(TARGET_x86_64 OR TARGET_i386)
-	list(APPEND AS_SOURCES i386.c)
-elseif(TARGET_ARM64)
-	list(APPEND AS_SOURCES arm.c)
-endif()
 
 add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-as ${AS_SOURCES})

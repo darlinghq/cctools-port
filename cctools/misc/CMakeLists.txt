@@ -24,49 +24,13 @@ add_definitions(-U__APPLE__
 	-Du_short=uint16_t -Du_int=uint32_t
 	-DPACKAGE_NAME="lipo"
 	-DRANLIB
-	-DPACKAGE_VERSION="1.0")
-
-# i386 has a different CPU type/subtype, but Darling only supports x86_64
-if (TARGET_x86_64 OR TARGET_i386)
-	add_definitions(
-		-DEMULATED_HOST_CPU_TYPE=16777223
-		-DEMULATED_HOST_CPU_SUBTYPE=3
-	)
-elseif (TARGET_ARM64)
-	add_definitions(
-		-DEMULATED_HOST_CPU_TYPE=16777228
-		-DEMULATED_HOST_CPU_SUBTYPE=0
-	)
-endif(TARGET_x86_64 OR TARGET_i386)
-
-add_library(stuff OBJECT
-	../libstuff/fatals.c
-	../libstuff/bytesex.c
-	../libstuff/allocate.c
-	../libstuff/errors.c
-	../libstuff/arch.c
-	../libstuff/arch_usage.c
-	../libstuff/port.c
-	../libstuff/apple_version.c
-	../libstuff/execute.c
-	../libstuff/rnd.c
-	../libstuff/ofile.c
-	../libstuff/ofile_error.c
-	../libstuff/unix_standard_mode.c
-	../libstuff/version_number.c
-	../libstuff/print.c
-	../libstuff/swap_headers.c
-	../libstuff/get_arch_from_host.c
-	../libstuff/set_arch_flag_name.c
-	../libstuff/get_toc_byte_sex.c
-	../libstuff/args.c
-	../libstuff/write64.c
+	-DPACKAGE_VERSION="1.0"
 )
+
 
 set(lipo_sources
 	lipo.c
-	$<TARGET_OBJECTS:stuff>
 )
 
 add_executable(lipo ${lipo_sources})
-target_link_libraries(lipo m)
+target_link_libraries(lipo m cctools_port_libstuff)

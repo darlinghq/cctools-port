@@ -36,6 +36,7 @@ elseif (TARGET_ARM64)
 	)
 endif(TARGET_x86_64 OR TARGET_i386)
 
+
 set(ar_sources
 	append.c
 	ar.c
@@ -47,19 +48,19 @@ set(ar_sources
 	move.c
 	print.c
 	replace.c
-	../libstuff/unix_standard_mode.c
-	../libstuff/execute.c
-	../libstuff/port.c
-	../libstuff/fatals.c
-	../libstuff/allocate.c
 )
 
 add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-ar ${ar_sources})
+target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ar cctools_port_libstuff)
+
+
+# `ranlib` needs to be built here so that the `ar` executable can find the `runlib` executable
 
 set(ranlib_sources
 	../misc/libtool.c
-	$<TARGET_OBJECTS:stuff>
 )
+
 add_executable(ranlib ${ranlib_sources})
+target_link_libraries(ranlib cctools_port_libstuff)
 set_property(TARGET ranlib APPEND_STRING PROPERTY COMPILE_FLAGS " -DRANLIB")
 set_target_properties(ranlib PROPERTIES OUTPUT_NAME "${APPLE_TARGET_TRIPLET_PRIMARY}-ranlib")
