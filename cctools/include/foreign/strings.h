@@ -1,8 +1,13 @@
+#ifndef _FOREIGN_STRINGS_H_
+#define _FOREIGN_STRINGS_H_
+
 #include_next <strings.h>
 
 #undef bcmp
 #undef bzero
 #undef bcopy
+#undef index
+#undef rindex
 
 #ifndef HAVE_BCMP
 static inline int bcmp(const void *s1, const void *s2, size_t n)
@@ -28,13 +33,15 @@ static inline void bcopy(const void *src, void *dest, size_t n)
 #ifndef HAVE_INDEX
 static inline char *index(const char *s, int c)
 {
-    return __builtin_strchr(s, c);
+    return (char *)__builtin_strchr(s, c);
 }
 #endif
 
 #ifndef HAVE_RINDEX
 static inline char *rindex(const char *s, int c)
 {
-    return __builtin_strrchr(s, c);
+    return (char *)__builtin_strrchr(s, c);
 }
 #endif
+
+#endif /* _FOREIGN_STRINGS_H_ */
