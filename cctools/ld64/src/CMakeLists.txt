@@ -4,7 +4,7 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_compile_definitions(__arm64__)
 endif()
 
-add_definitions(-DHAVE_BCMP=1 -DHAVE_BZERO=1 -DHAVE_BCOPY=1 -DHAVE_INDEX=1 -DHAVE_RINDEX=1)
+add_definitions(-DHAVE_BCMP=1  -DHAVE_BCOPY=1  )
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-everything")
 
