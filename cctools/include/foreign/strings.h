@@ -3,7 +3,7 @@
 
 #include_next <strings.h>
 
-#if defined(__GLIBC__) || defined(__linux__)
+#if (defined(__GLIBC__) || defined(__linux__)) && !defined(__ANDROID__)
 #ifndef HAVE_BCMP
 #define HAVE_BCMP 1
 #endif
