@@ -3,6 +3,24 @@
 
 #include_next <strings.h>
 
+#if defined(__GLIBC__) || defined(__linux__)
+#ifndef HAVE_BCMP
+#define HAVE_BCMP 1
+#endif
+#ifndef HAVE_BZERO
+#define HAVE_BZERO 1
+#endif
+#ifndef HAVE_BCOPY
+#define HAVE_BCOPY 1
+#endif
+#ifndef HAVE_INDEX
+#define HAVE_INDEX 1
+#endif
+#ifndef HAVE_RINDEX
+#define HAVE_RINDEX 1
+#endif
+#endif
+
 #undef bcmp
 #undef bzero
 #undef bcopy
