@@ -89,7 +89,11 @@ set(ld64_sources
 )
 
 add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-ld ${ld64_sources})
-target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld -lpthread -ldl)
+if(ANDROID)
+	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld -ldl)
+else()
+	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld -lpthread -ldl)
+endif()
 
 # musl libc systems need libexecinfo
 find_library(EXECINFO
