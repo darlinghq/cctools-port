@@ -28,7 +28,7 @@ add_definitions(-U__APPLE__
 	-DSTDC_HEADERS=1 -DHAVE_SYS_TYPES_H=1 -DHAVE_SYS_STAT_H=1 -DHAVE_STDLIB_H=1 -DHAVE_STRING_H=1 -DHAVE_MEMORY_H=1 -DHAVE_STRINGS_H=1 -DHAVE_INTTYPES_H=1 -DHAVE_STDINT_H=1 -DHAVE_UNISTD_H=1 -DHAVE_DLFCN_H=1
 	-Du_short=uint16_t)
 
-if(NOT ANDROID)
+if(NOT (ANDROID OR CMAKE_SYSTEM_NAME MATCHES "Android" OR CMAKE_C_FLAGS MATCHES "android" OR CMAKE_CXX_FLAGS MATCHES "android"))
 	add_definitions(-DHAVE_EXECINFO_H=1)
 endif()
 
@@ -89,7 +89,7 @@ set(ld64_sources
 )
 
 add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-ld ${ld64_sources})
-if(ANDROID)
+if(ANDROID OR CMAKE_SYSTEM_NAME MATCHES "Android" OR CMAKE_C_FLAGS MATCHES "android" OR CMAKE_CXX_FLAGS MATCHES "android")
 	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld -ldl)
 else()
 	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld -lpthread -ldl)
