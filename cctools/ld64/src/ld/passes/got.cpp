@@ -286,8 +286,34 @@ void doPass(const Options& opts, ld::Internal& internal)
 						targetIsWeakImport = fit->weakImport;
 						break;
                     default:
-                        break;   
+                        break;
 				}
+#if SUPPORT_ARCH_arm64
+				// DARLING: arm64e compilers load a signed function pointer through a GOT_LOAD of a pointer slot
+				// they emit in __auth_ptr (e.g. l_foo$auth_ptr$ia$0). That slot already is the GOT entry: the
+				// code must load the slot's contents, which dyld fills with the signed pointer. Treating the
+				// slot as an ordinary GOT target turns the load into an ADD, which yields the slot's address.
+				if ( (targetOfGOT != NULL) && (strcmp(targetOfGOT->section().sectionName(), "__auth_ptr") == 0) ) {
+					bool rewritten = true;
+					switch ( fit->kind ) {
+						case ld::Fixup::kindStoreTargetAddressARM64GOTLoadPage21:
+							fit->kind = ld::Fixup::kindStoreTargetAddressARM64Page21;
+							break;
+						case ld::Fixup::kindStoreTargetAddressARM64GOTLoadPageOff12:
+							fit->kind = ld::Fixup::kindStoreTargetAddressARM64PageOff12;
+							break;
+						default:
+							rewritten = false;
+							break;
+					}
+					if ( rewritten ) {
+						if ( log ) fprintf(stderr, "GOT load of auth pointer slot %s in %s is a direct load\n", targetOfGOT->name(), atom->name());
+						fit->binding = ld::Fixup::bindingDirectlyBound;
+						fit->u.target = targetOfGOT;
+						continue;
+					}
+				}
+#endif
 				bool optimizable;
 				bool targetIsExternalWeakDef;
 				bool targetIsPersonalityFn;
