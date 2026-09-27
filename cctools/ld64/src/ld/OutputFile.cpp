@@ -2671,8 +2671,22 @@ static bool chainedFixupAddendFitsInline(uint64_t accumulator, uint16_t chainedP
 	return false;
 }
 
+// <rdar://problem/13828711> an import alias (e.g. a re-exported N_INDR symbol) binds as its base
+const ld::Atom* OutputFile::importAliasBase(const ld::Atom* target)
+{
+	if ( target->isAlias() && (target->definition() == ld::Atom::definitionProxy) ) {
+		for (ld::Fixup::iterator fit = target->fixupsBegin(), end=target->fixupsEnd(); fit != end; ++fit) {
+			if ( fit->firstInCluster() && (fit->kind == ld::Fixup::kindNoneFollowOn)
+				 && (fit->binding == ld::Fixup::bindingDirectlyBound) )
+				return fit->u.target;
+		}
+	}
+	return target;
+}
+
 bool OutputFile::needsBind(const ld::Atom* toTarget, uint64_t* accumulator, uint64_t* inlineAddend,
 						   uint32_t* bindOrdinal, uint32_t* libOrdinal) const {
+	toTarget = importAliasBase(toTarget);
 	bool isBind = false;
 	bool isWeakBind = false;
 	switch ( toTarget->definition() ) {
@@ -2740,21 +2754,26 @@ bool OutputFile::needsBind(const ld::Atom* toTarget, uint64_t* accumulator, uint
 		if ( bindOrdinal != nullptr )
 			*bindOrdinal = _chainedFixupBinds.ordinal(toTarget, *accumulator);
 		if ( libOrdinal != nullptr ) {
-			const ld::dylib::File* dylib = (ld::dylib::File*)(toTarget->file());
-			if ( dylib != nullptr ) {
+			// flat namespace images bind every import by name, as compressedOrdinalForAtom() does
+			// for opcode-based binds; this also covers -undefined suppress, which requires it
+			if ( _options.nameSpace() != Options::kTwoLevelNameSpace ) {
+				*libOrdinal = BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
+			}
+			else if ( const ld::dylib::File* dylib = dynamic_cast<const ld::dylib::File*>(toTarget->file()) ) {
 				*libOrdinal = dylibToOrdinal(dylib);
 			}
+			// handle undefined dynamic_lookup
+			else if ( _options.undefinedTreatment() == Options::kUndefinedDynamicLookup ) {
+				if ( _options.sharedRegionEligible() )
+					throwf("-undefined dynamic_lookup cannot be used to find '%s' in dylib in dyld shared cache", toTarget->name());
+				*libOrdinal = BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
+			}
+			// handle -U _foo
+			else if ( _options.allowedUndefined(toTarget->name()) ) {
+				*libOrdinal = BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
+			}
 			else {
-				// handle undefined dynamic_lookup
-				if ( _options.undefinedTreatment() == Options::kUndefinedDynamicLookup ) {
-					if ( _options.sharedRegionEligible() )
-						throwf("-undefined dynamic_lookup cannot be used to find '%s' in dylib in dyld shared cache", toTarget->name());
-					return BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
-				}
-
-				// handle -U _foo
-				if ( _options.allowedUndefined(toTarget->name()) )
-					return BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
+				throwf("can't find ordinal for imported symbol '%s'", toTarget->name());
 			}
 		}
 	}
@@ -5053,8 +5072,9 @@ void OutputFile::buildChainedFixupInfo(ld::Internal& state)
 						uint16_t pageOffset = fixUpAddr - (_chainedFixupSegments.back().startAddr + pageIndex*pageSize);
 						_chainedFixupSegments.back().pages[pageIndex].fixupOffsets.push_back(pageOffset);
 						// build map for binds
-						if ( needsBind(target, &accumulator) )
-							_chainedFixupBinds.ensureTarget(target, accumulator);
+						const ld::Atom* bindTarget = importAliasBase(target);
+						if ( needsBind(bindTarget, &accumulator) )
+							_chainedFixupBinds.ensureTarget(bindTarget, accumulator);
 					}
 				}
 			}
@@ -5307,18 +5327,7 @@ void OutputFile::addDyldInfo(ld::Internal& state,  ld::Internal::FinalSection* s
 	}
 	
 	// <rdar://problem/13828711> if target is an import alias, use base of alias
-	if ( target->isAlias() && (target->definition() == ld::Atom::definitionProxy) ) {
-		for (ld::Fixup::iterator fit = target->fixupsBegin(), end=target->fixupsEnd(); fit != end; ++fit) {
-			if ( fit->firstInCluster() ) {
-				if ( fit->kind == ld::Fixup::kindNoneFollowOn ) {
-					if ( fit->binding == ld::Fixup::bindingDirectlyBound ) {
-						//fprintf(stderr, "switching import of %s to import of %s\n", target->name(),  fit->u.target->name());
-						target = fit->u.target;
-					}
-				}
-			}
-		}
-	}
+	target = importAliasBase(target);
 
 	// Find the ordinal for the bind target
 	int compressedOrdinal = 0;
