@@ -102,3 +102,8 @@ find_library(EXECINFO
 if(EXECINFO)
 	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld "${EXECINFO}")
 endif()
+
+install(TARGETS ${APPLE_TARGET_TRIPLET_PRIMARY}-ld
+	DESTINATION libexec/darling/Library/Developer/DarlingCLT/usr/bin
+	RENAME ld
+)
