@@ -3,12 +3,17 @@
 #ifndef STRLCAT_H
 #define STRLCAT_H
 
+#include <string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 #include <stddef.h>
 
+/* glibc >= 2.38 declares it (with __THROW); redeclaring it differs and fails in C++ */
+#if !(defined(__GLIBC__) && defined(__GLIBC_PREREQ) && __GLIBC_PREREQ(2, 38) && defined(__USE_MISC))
 size_t strlcat(char *dst, const char *src, size_t siz);
+#endif
 
 #ifdef __cplusplus
 }
