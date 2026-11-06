@@ -1362,12 +1362,16 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 	bool is_blx;
 	bool is_b;
 	bool thumbTarget = false;
+	// a delta (target - from) is resolved at link time and never needs a chained fixup
+	bool isDelta = false;
 	std::map<uint32_t, const Fixup*> usedByHints;
 #if SUPPORT_ARCH_arm64e
 	Fixup::AuthData authData;
 #endif
 	for (ld::Fixup::iterator fit = atom->fixupsBegin(), end=atom->fixupsEnd(); fit != end; ++fit) {
 		uint8_t* fixUpLocation = &buffer[fit->offsetInAtom];
+		if ( fit->firstInCluster() )
+			isDelta = false;
 		ld::Fixup::LOH_arm64 lohExtra;
 		switch ( (ld::Fixup::Kind)(fit->kind) ) { 
 			case ld::Fixup::kindNone:
@@ -1389,6 +1393,7 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 				delta = addressOf(state, fit, &fromTarget);
 				if ( ! fit->contentAddendOnly )
 					accumulator -= delta;
+				isDelta = true;
 				break;
 			case ld::Fixup::kindAddAddend:
 				if ( ! fit->contentIgnoresAddend ) {
@@ -1430,7 +1435,7 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 				break;
 			case ld::Fixup::kindStoreLittleEndian32:
 				rangeCheckAbsolute32(accumulator, state, atom, fit);
-				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && (atom->contentType() != ld::Atom::ContentType::typeCFI)
+				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && !isDelta && (atom->contentType() != ld::Atom::ContentType::typeCFI)
 				 	&& (atom->section().type() != ld::Section::typeUnwindInfo) && (atom->section().type() != ld::Section::typeCode)
 				 	&& (atom->section().type() != ld::Section::typeDtraceDOF)  )
 					setFixup32(fixUpLocation, accumulator, toTarget);
@@ -1438,7 +1443,7 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 					set32LE(fixUpLocation, accumulator);
 				break;
 			case ld::Fixup::kindStoreLittleEndian64:
-				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && (atom->contentType() != ld::Atom::ContentType::typeCFI) )
+				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && !isDelta && (atom->contentType() != ld::Atom::ContentType::typeCFI) )
 					setFixup64(fixUpLocation, accumulator, toTarget);
 				else
 					set64LE(fixUpLocation, accumulator);
