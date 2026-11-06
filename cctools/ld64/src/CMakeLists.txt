@@ -15,7 +15,6 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../include/foreign)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ld)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/ld/parsers)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/3rd)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/3rd/BlocksRuntime)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/3rd/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/abstraction)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -75,8 +74,6 @@ set(ld64_sources
 	ld/PlatformSupport.cpp
 	./3rd/md5.c
 	./3rd/strlcat.c
-	./3rd/BlocksRuntime/runtime.c
-	./3rd/BlocksRuntime/data.c
 	./3rd/helper.c
 	./3rd/strlcpy.c
 	./3rd/qsort_r.c
@@ -87,6 +84,21 @@ set(ld64_sources
 
 add_executable(${APPLE_TARGET_TRIPLET_PRIMARY}-ld ${ld64_sources})
 target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld -lpthread -ldl)
+
+option(USE_SYSTEM_BLOCKSRUNTIME "Use the system BlocksRuntime instead of the bundled copy" OFF)
+
+if(USE_SYSTEM_BLOCKSRUNTIME)
+	find_path(BLOCKSRUNTIME_INCLUDE_DIR Block.h PATH_SUFFIXES blocksruntime REQUIRED)
+	find_library(BLOCKSRUNTIME_LIBRARY BlocksRuntime REQUIRED)
+	target_include_directories(${APPLE_TARGET_TRIPLET_PRIMARY}-ld PRIVATE "${BLOCKSRUNTIME_INCLUDE_DIR}")
+	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld "${BLOCKSRUNTIME_LIBRARY}")
+else()
+	target_sources(${APPLE_TARGET_TRIPLET_PRIMARY}-ld PRIVATE
+		./3rd/BlocksRuntime/runtime.c
+		./3rd/BlocksRuntime/data.c
+	)
+	target_include_directories(${APPLE_TARGET_TRIPLET_PRIMARY}-ld PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/3rd/BlocksRuntime")
+endif()
 
 # musl libc systems need libexecinfo
 find_library(EXECINFO
