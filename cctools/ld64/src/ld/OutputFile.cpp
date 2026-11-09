@@ -1415,8 +1415,10 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 			case ld::Fixup::kindSetTargetImageOffset:
 				accumulator = addressOf(state, fit, &toTarget) - mhAddress;
 				thumbTarget = targetIsThumb(state, fit);
-				if ( thumbTarget ) 
+				if ( thumbTarget )
 					accumulator |= 1;
+				// an offset from the mach_header is resolved at link time too
+				isDelta = true;
 				break;
 			case ld::Fixup::kindSetTargetSectionOffset:
 				accumulator = sectionOffsetOf(state, fit);
