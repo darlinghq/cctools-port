@@ -66,6 +66,7 @@ public:
 	int							compressedOrdinalForAtom(const ld::Atom* target);
 	uint64_t					fileSize() const { return _fileSize; }
 
+	static const ld::Atom*		importAliasBase(const ld::Atom* target);
 	bool						needsBind(const ld::Atom* toTarget, uint64_t* accumulator = nullptr,
 										  uint64_t* inlineAddend = nullptr, uint32_t* bindOrdinal = nullptr,
 										  uint32_t* libOrdinal = nullptr) const;
