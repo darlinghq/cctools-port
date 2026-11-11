@@ -9,7 +9,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-everything")
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include/foreign)
 
-add_definitions(-DHAVE_BCMP=1 -DHAVE_BZERO=1 -DHAVE_BCOPY=1 -DHAVE_INDEX=1 -DHAVE_RINDEX=1)
+add_definitions(-DHAVE_BCMP=1  -DHAVE_BCOPY=1  )
 
 add_definitions(-U__APPLE__
 	-D__STDC_LIMIT_MACROS=1

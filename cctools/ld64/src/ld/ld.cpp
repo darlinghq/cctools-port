@@ -36,7 +36,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <unistd.h>
-#if HAVE_EXECINFO_H // ld64-port
+#if HAVE_EXECINFO_H && !defined(__ANDROID__) // ld64-port
 #include <execinfo.h>
 #endif // HAVE_EXECINFO_H
 #include <mach/mach_time.h>
@@ -1452,7 +1452,7 @@ int main(int argc, const char* argv[])
 // implement assert() function to print out a backtrace before aborting
 void __assert_rtn(const char* func, const char* file, int line, const char* failedexpr)
 {
-#ifdef HAVE_EXECINFO_H // ld64-port
+#if defined(HAVE_EXECINFO_H) && !defined(__ANDROID__) // ld64-port
     Snapshot *snapshot = Snapshot::globalSnapshot;
     
     snapshot->setSnapshotMode(Snapshot::SNAPSHOT_DEBUG);
