@@ -109,3 +109,9 @@ find_library(EXECINFO
 if(EXECINFO)
 	target_link_libraries(${APPLE_TARGET_TRIPLET_PRIMARY}-ld "${EXECINFO}")
 endif()
+
+# install(TARGETS) has no RENAME, so install the built file as a program
+install(PROGRAMS $<TARGET_FILE:${APPLE_TARGET_TRIPLET_PRIMARY}-ld>
+	DESTINATION libexec/darling/Library/Developer/DarlingCLT/usr/bin
+	RENAME ld
+)
