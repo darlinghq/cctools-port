@@ -1,7 +1,7 @@
 project(as)
 
 
-if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
+if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 	add_compile_definitions(__arm64__)
 endif()
 
