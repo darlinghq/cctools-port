@@ -308,6 +308,7 @@ public:
 
 protected:
 	void addFixupAtOffset(uint32_t offset);
+	void addMethodListFixupAtOffset(uint32_t offset);
 
 private:
 	typedef typename A::P::uint_t			pint_t;
@@ -893,11 +894,36 @@ void ObjCOverlayAtom<A>::addFixupAtOffset(uint32_t offset)
 	_fixups.push_back(ld::Fixup(offset, ld::Fixup::k1of1, pointerFixupKind<typename A::P>(), targetAtom));
 }
 
+template <typename A>
+bool isArm64e() { return false; }
+#if SUPPORT_ARCH_arm64e
+template <>
+bool isArm64e<arm64e>() { return true; }
+#endif
+
+// The arm64e objc runtime authenticates method list pointers (class_ro_t.baseMethods,
+// category_t.instanceMethods/classMethods): key DA, discriminator 0xC310, address diversified.
+// The other list pointers (protocols, properties) are read unsigned.
+template <typename A>
+void ObjCOverlayAtom<A>::addMethodListFixupAtOffset(uint32_t offset)
+{
+#if SUPPORT_ARCH_arm64e
+	if ( isArm64e<A>() ) {
+		const ld::Atom* targetAtom = this; // temporary
+		ld::Fixup::AuthData authData = { 0xC310, true, ld::Fixup::AuthData::ptrauth_key_asda };
+		_fixups.push_back(ld::Fixup(offset, ld::Fixup::k1of2, ld::Fixup::kindSetAuthData, authData));
+		_fixups.push_back(ld::Fixup(offset, ld::Fixup::k2of2, ld::Fixup::kindStoreTargetAddressLittleEndianAuth64, targetAtom));
+		return;
+	}
+#endif
+	this->addFixupAtOffset(offset);
+}
+
 
 template <typename A>
 void ClassROOverlayAtom<A>::addMethodListFixup()
 {
-	this->addFixupAtOffset(offsetof(typename Class<A>::ROContent, baseMethods));
+	this->addMethodListFixupAtOffset(offsetof(typename Class<A>::ROContent, baseMethods));
 }
 
 template <typename A>
@@ -921,13 +947,13 @@ void CategoryOverlayAtom<A>::addNameFixup()
 template <typename A>
 void CategoryOverlayAtom<A>::addInstanceMethodListFixup()
 {
-	this->addFixupAtOffset(offsetof(typename Category<A>::Content, instanceMethods));
+	this->addMethodListFixupAtOffset(offsetof(typename Category<A>::Content, instanceMethods));
 }
 
 template <typename A>
 void CategoryOverlayAtom<A>::addClassMethodListFixup()
 {
-	this->addFixupAtOffset(offsetof(typename Category<A>::Content, classMethods));
+	this->addMethodListFixupAtOffset(offsetof(typename Category<A>::Content, classMethods));
 }
 
 template <typename A>
