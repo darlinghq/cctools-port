@@ -69,7 +69,7 @@ public:
 	static const ld::Atom*		importAliasBase(const ld::Atom* target);
 	bool						needsBind(const ld::Atom* toTarget, uint64_t* accumulator = nullptr,
 										  uint64_t* inlineAddend = nullptr, uint32_t* bindOrdinal = nullptr,
-										  uint32_t* libOrdinal = nullptr) const;
+										  uint32_t* libOrdinal = nullptr, bool authenticated = false) const;
 	
 	
 	bool						usesWeakExternalSymbols;
