@@ -7,10 +7,11 @@ that creates such a list where there was none must emit the same authenticated
 fixup, otherwise the runtime traps (brk #0xc472) on the plain pointer.
 
 Usage: LD64=/path/to/aarch64-apple-darwin20-ld python3 -I run.py [clang]
-Host only: needs clang with the arm64e Darwin target; no SDK, no guest. Without
+Host only: needs a clang with the arm64e Darwin target that signs the method list pointers it emits (Apple's does;
+with others the control link also reports plain method lists); no SDK, no guest. Without
 LD64 it prints SKIP and exits 0. Exit 1 on any mismatch.
 
-Steps: compile objc-merge.m with clang, clear the cpusubtype caps byte (the in-tree
+Steps: compile objc-merge.m with clang, clear the cpusubtype caps byte if there is one (the in-tree
 ld64 predates it and would treat the object as plain arm64), link a dylib against
 two tiny stub dylibs with ld64 (merging on, then -no_objc_category_merging as a
 control), and read the chained fixups of the result back.
@@ -41,7 +42,8 @@ def compile_obj(clang, src, out):
     run([clang, "--target=" + TARGET, "-c", src, "-o", raw])
     data = bytearray(open(raw, "rb").read())
     magic, cputype, subtype = struct.unpack_from("<III", data, 0)
-    if (magic, cputype, subtype) != (0xFEEDFACF, 0x0100000C, 0x80000002):
+    # Newer clang puts a capability byte in the cpusubtype (0x80000002); older clang writes a plain 2.
+    if (magic, cputype) != (0xFEEDFACF, 0x0100000C) or subtype not in (0x2, 0x80000002):
         sys.exit("FAIL: unexpected object header %#x %#x %#x" % (magic, cputype, subtype))
     struct.pack_into("<I", data, 8, 0x2)
     open(out, "wb").write(data)
