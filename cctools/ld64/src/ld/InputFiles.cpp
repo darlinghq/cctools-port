@@ -322,8 +322,10 @@ ld::File* InputFiles::makeFile(const Options::FileInfo& info, bool indirectDylib
 			}
 			// if requested architecture is page aligned within fat file, then remap just that portion of file
 			// ld64-port: remapping the file on Cygwin fails for an unknown reason, so always go the alternative way there
+			// ld64-port: mmap needs an offset aligned to the page size of the host, which is larger than
+			// PAGE_SIZE on 16 KB or 64 KB hosts, so it is asked at run time
 #ifndef __CYGWIN__
-			if ( (fileOffset & PAGE_MASK) == 0 ) {
+			if ( (fileOffset & ((uint32_t)::sysconf(_SC_PAGESIZE) - 1)) == 0 ) {
 				// unmap whole file
 				munmap((caddr_t)p, stat_buf.st_size);
 				// re-map just part we need
