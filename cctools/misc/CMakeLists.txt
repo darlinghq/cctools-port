@@ -27,17 +27,18 @@ add_definitions(-U__APPLE__
 	-DPACKAGE_VERSION="1.0")
 
 # i386 has a different CPU type/subtype, but Darling only supports x86_64
-if (TARGET_x86_64 OR TARGET_i386)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../emulated_host.cmake)
+if (NOT CCTOOLS_EMULATED_HOST_ARM)
 	add_definitions(
 		-DEMULATED_HOST_CPU_TYPE=16777223
 		-DEMULATED_HOST_CPU_SUBTYPE=3
 	)
-elseif (TARGET_ARM64)
+else ()
 	add_definitions(
 		-DEMULATED_HOST_CPU_TYPE=16777228
 		-DEMULATED_HOST_CPU_SUBTYPE=0
 	)
-endif(TARGET_x86_64 OR TARGET_i386)
+endif (NOT CCTOOLS_EMULATED_HOST_ARM)
 
 add_library(stuff OBJECT
 	../libstuff/fatals.c
