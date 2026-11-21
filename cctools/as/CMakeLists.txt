@@ -6,12 +6,13 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 endif()
 
 # i386 has a different CPU type/subtype, but Darling only supports x86_64
-if(TARGET_x86_64 OR TARGET_i386)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../emulated_host.cmake)
+if (NOT CCTOOLS_EMULATED_HOST_ARM)
 	add_compile_definitions(
 		EMULATED_HOST_CPU_TYPE=16777223
 		EMULATED_HOST_CPU_SUBTYPE=3
 	)
-elseif(TARGET_ARM64)
+else ()
 	add_compile_definitions(
 		EMULATED_HOST_CPU_TYPE=16777228
 		EMULATED_HOST_CPU_SUBTYPE=0
@@ -57,7 +58,7 @@ add_definitions(
 
 remove_definitions()
 
-if(TARGET_x86_64 OR TARGET_i386)
+if (NOT CCTOOLS_EMULATED_HOST_ARM)
 	add_compile_definitions(
 		I386
 		i486
@@ -65,7 +66,7 @@ if(TARGET_x86_64 OR TARGET_i386)
 		i686
 		ARCH64
 	)
-elseif(TARGET_ARM64)
+else ()
 	add_compile_definitions(ARM)
 endif()
 
@@ -112,9 +113,9 @@ set(AS_SOURCES
 	../libstuff/fatals.c
 )
 
-if(TARGET_x86_64 OR TARGET_i386)
+if (NOT CCTOOLS_EMULATED_HOST_ARM)
 	list(APPEND AS_SOURCES i386.c)
-elseif(TARGET_ARM64)
+else ()
 	list(APPEND AS_SOURCES arm.c)
 endif()
 
