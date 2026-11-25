@@ -366,7 +366,9 @@ File<A>::File(const uint8_t* fileContent, uint64_t fileLength, const char* path,
 	}
 
 	if ( symtab != nullptr ) {
-		if ( symtab->symoff() < _linkeditStartOffset )
+		// DARLING: a dylib with no symbols (one that only re-exports others)
+		// has symoff 0, as ld64 itself writes it; an empty table is nowhere.
+		if ( (symtab->nsyms() != 0) && (symtab->symoff() < _linkeditStartOffset) )
 			throwf("malformed mach-o, symbol table not in __LINKEDIT");
 		if ( symtab->stroff() < _linkeditStartOffset )
 			throwf("malformed mach-o, symbol table strings not in __LINKEDIT");
